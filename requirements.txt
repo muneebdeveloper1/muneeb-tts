@@ -2,3 +2,4 @@ streamlit
 edge-tts
 pillow
 pdfplumber
+python-docx
