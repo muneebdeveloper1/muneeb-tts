@@ -20,7 +20,7 @@ with col1:
     st.image("logo.png", width=150)
 
 with col2:
-    st.title("Keep Laughing with Muneeb")
+    st.title("Keep Laughing with Hussaa1nn")
 
 # ---------------------------------------------------
 # LOAD EDGE TTS VOICES
