@@ -1,5 +1,7 @@
 streamlit
-edge-tts
+edge-tts==7.2.8
 pillow
 pdfplumber
 python-docx
+pandas
+openpyxl
