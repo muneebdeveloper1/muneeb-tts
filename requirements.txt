@@ -1,5 +1,5 @@
 streamlit
-edge-tts==7.2.8
+edge-tts==7.3.1
 pillow
 pdfplumber
 python-docx
