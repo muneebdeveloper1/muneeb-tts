@@ -82,6 +82,17 @@ LANGUAGE_MAP = {
     "vi-VN": "Vietnamese (Vietnam)"
 }
 
+# Group Locales under Base Languages (e.g., "English" -> ["en-US", "en-GB", ...])
+base_lang_map = {}
+for loc in set([v["Locale"] for v in voices]):
+    display_name = LANGUAGE_MAP.get(loc, loc)
+    base_name = display_name.split(" (")[0]
+    if base_name not in base_lang_map:
+        base_lang_map[base_name] = []
+    base_lang_map[base_name].append(loc)
+
+base_languages = sorted(list(base_lang_map.keys()))
+
 def extract_text(uploaded_file):
     extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
     if extension == "txt":
@@ -140,8 +151,7 @@ with tab1:
 
     st.divider()
 
-    all_locales = sorted(list(set([v["Locale"] for v in voices])))
-    if "selected_lang_t1" not in st.session_state: st.session_state.selected_lang_t1 = all_locales[0]
+    if "selected_base_lang_t1" not in st.session_state: st.session_state.selected_base_lang_t1 = "English"
     if "detect_msg_t1" not in st.session_state: st.session_state.detect_msg_t1 = None
 
     def detect_lang_t1():
@@ -151,20 +161,29 @@ with tab1:
             return
         try:
             code = detect(text[:1000])
-            matches = [loc for loc in all_locales if loc.startswith(code)]
-            if matches:
-                defaults = {'en': 'en-US', 'ur': 'ur-PK', 'hi': 'hi-IN', 'zh': 'zh-CN', 'fr': 'fr-FR', 'es': 'es-ES', 'ar': 'ar-SA'}
-                best = defaults.get(code) if defaults.get(code) in matches else matches[0]
-                st.session_state.selected_lang_t1 = best
-                st.session_state.detect_msg_t1 = f"success|Detected: **{LANGUAGE_MAP.get(best, best)}**"
+            # Find which base language matches this code
+            match_found = None
+            for base_l in base_languages:
+                # Check if any locale in this base language starts with the detected code
+                if any(loc.startswith(code) for loc in base_lang_map[base_l]):
+                    match_found = base_l
+                    break
+            
+            if match_found:
+                st.session_state.selected_base_lang_t1 = match_found
+                st.session_state.detect_msg_t1 = f"success|Detected Language: **{match_found}**"
             else:
-                st.session_state.detect_msg_t1 = f"warning|Detected '{code}', but no matching voice."
+                st.session_state.detect_msg_t1 = f"warning|Detected '{code}', but no voices found."
         except:
             st.session_state.detect_msg_t1 = "error|Could not detect language."
 
     col_lang, col_btn = st.columns([3, 1])
     with col_lang:
-        selected_locale_t1 = st.selectbox("🌍 Select Language", all_locales, format_func=lambda x: LANGUAGE_MAP.get(x, x), key="selected_lang_t1")
+        selected_base_lang = st.selectbox(
+            "🌍 Main Language", 
+            base_languages, 
+            key="selected_base_lang_t1"
+        )
     with col_btn:
         st.write("")
         st.write("")
@@ -176,7 +195,10 @@ with tab1:
         elif msg_t == "warning": st.warning(msg_txt)
         else: st.error(msg_txt)
 
-    filtered = [v for v in voices if v["Locale"] == selected_locale_t1]
+    # Filter voices by selected base language
+    valid_locales = base_lang_map[selected_base_lang]
+    filtered = [v for v in voices if v["Locale"] in valid_locales]
+
     if "gender_filter_t1" not in st.session_state: st.session_state.gender_filter_t1 = "All"
     
     g1, g2, g3 = st.columns(3)
@@ -187,7 +209,8 @@ with tab1:
     if st.session_state.gender_filter_t1 != "All":
         filtered = [v for v in filtered if v["Gender"] == st.session_state.gender_filter_t1]
 
-    voice_names = [v["ShortName"].split("-")[-1].replace("Neural","") + f" ({v['Gender']})" for v in filtered]
+    # Format: "Guy (Male, US)"
+    voice_names = [f"{v['ShortName'].split('-')[-1].replace('Neural','')} ({v['Gender']}, {v['Locale'].split('-')[-1]})" for v in filtered]
     voice_choice_t1 = st.selectbox("🎤 Select Voice", voice_names)
     selected_voice_t1 = filtered[voice_names.index(voice_choice_t1)]["ShortName"]
 
@@ -201,11 +224,10 @@ with tab1:
         if not text_to_speak.strip():
             st.warning("Please provide text before generating.")
         else:
-            status_box = st.empty() # Placeholder for text underneath button
+            status_box = st.empty()
             start_time = time.time()
             try:
                 status_box.info("Audio creating... 20% done")
-                # Simulate steps for UI feedback
                 status_box.info("Audio creating... 50% done")
                 audio_bytes = asyncio.run(generate_audio_async(text_to_speak, selected_voice_t1, f"{speed_t1:+d}%", f"{pitch_t1:+d}Hz"))
                 
@@ -240,25 +262,29 @@ with tab2:
     char_configs = {}
     for i in range(st.session_state.num_chars):
         st.markdown(f"**Character {i+1}**")
-        c_name, c_lang, c_voice = st.columns([2, 3, 3])
+        c_name, c_lang, c_voice = st.columns([2, 2, 4])
         
         default_name = "Alex" if i == 0 else ("Sarah" if i == 1 else f"Character {i+1}")
         c_name_val = c_name.text_input("Name", value=default_name, key=f"c_name_{i}")
         
-        c_lang_val = c_lang.selectbox("Language", all_locales, format_func=lambda x: LANGUAGE_MAP.get(x, x), key=f"c_lang_{i}")
+        c_lang_val = c_lang.selectbox("Main Language", base_languages, key=f"c_lang_{i}")
         
-        filtered_v = [v for v in voices if v["Locale"] == c_lang_val]
-        v_names = [v["ShortName"].split("-")[-1].replace("Neural","") + f" ({v['Gender']})" for v in filtered_v]
-        c_voice_val = c_voice.selectbox("Voice", v_names, key=f"c_voice_{i}")
+        # Get valid voices for this character's language
+        c_valid_locales = base_lang_map[c_lang_val]
+        c_filtered_v = [v for v in voices if v["Locale"] in c_valid_locales]
         
-        char_configs[c_name_val.lower()] = filtered_v[v_names.index(c_voice_val)]["ShortName"]
+        # Format: "Guy (Male, US)"
+        c_v_names = [f"{v['ShortName'].split('-')[-1].replace('Neural','')} ({v['Gender']}, {v['Locale'].split('-')[-1]})" for v in c_filtered_v]
+        c_voice_val = c_voice.selectbox("Voice", c_v_names, key=f"c_voice_{i}")
+        
+        char_configs[c_name_val.lower()] = c_filtered_v[c_v_names.index(c_voice_val)]["ShortName"]
 
     st.write("")
     if st.button("🎬 Generate Dialogue Audio", use_container_width=True, type="primary"):
         if not dialogue_text.strip():
             st.warning("Please enter a script.")
         else:
-            status_box = st.empty() # Placeholder under button
+            status_box = st.empty()
             start_time = time.time()
             
             lines = [line.strip() for line in dialogue_text.split('\n') if line.strip()]
@@ -302,6 +328,15 @@ with tab3:
     studio_text = st.text_area("Paste long text here:", height=250, key="tab3_text")
     
     with st.expander("🛠️ Studio Settings", expanded=True):
+        # NEW: Voice Selection for Audiobook
+        audiobook_lang = st.selectbox("Main Language", base_languages, index=base_languages.index("English"), key="ab_lang")
+        ab_valid_locales = base_lang_map[audiobook_lang]
+        ab_filtered_v = [v for v in voices if v["Locale"] in ab_valid_locales]
+        ab_v_names = [f"{v['ShortName'].split('-')[-1].replace('Neural','')} ({v['Gender']}, {v['Locale'].split('-')[-1]})" for v in ab_filtered_v]
+        ab_voice_name = st.selectbox("Select Voice", ab_v_names, key="ab_voice")
+        audiobook_voice = ab_filtered_v[ab_v_names.index(ab_voice_name)]["ShortName"]
+        
+        st.divider()
         generate_srt = st.checkbox("Generate SRT Subtitles", value=True)
         music_file = st.file_uploader("Upload Background Music (Optional MP3)", type=["mp3"])
         music_volume = st.slider("Music Volume Reduction (dB)", -30, -5, -15)
@@ -312,7 +347,7 @@ with tab3:
         if not studio_text.strip():
             st.warning("Please enter text.")
         else:
-            status_box = st.empty() # Placeholder under button
+            status_box = st.empty()
             start_time = time.time()
             
             if clean_pdf:
@@ -325,13 +360,11 @@ with tab3:
             submaker = edge_tts.SubMaker() if generate_srt else None
 
             try:
-                default_voice = "en-US-ChristopherNeural"
-                
                 for i, chunk in enumerate(chunks):
                     percent = int(((i + 1) / total_chunks) * 100)
                     status_box.info(f"Audio creating... **{percent}%** done")
                     
-                    chunk_bytes = asyncio.run(generate_audio_async(chunk, default_voice, submaker=submaker))
+                    chunk_bytes = asyncio.run(generate_audio_async(chunk, audiobook_voice, submaker=submaker))
                     audio_chunks.append(chunk_bytes)
 
                 combined_audio = b"".join(audio_chunks)
