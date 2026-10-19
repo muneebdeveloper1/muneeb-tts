@@ -11,28 +11,27 @@ from pathlib import Path
 # PAGE CONFIGURATION
 # ---------------------------------------------------
 st.set_page_config(
-    page_title="WordWave",
+    page_title="Keep Laughing Voice Generator",
     page_icon="🎙️",
     layout="wide"
 )
 
 # ---------------------------------------------------
-# 🔑 SECRET OWNER UNLOCK GATEWAY
+# 🔑 OWNER UNLOCK GATEWAY (temporary shutdown notice)
 # ---------------------------------------------------
 if "app_unlocked" not in st.session_state:
     st.session_state["app_unlocked"] = False
 
-# If the app is not unlocked yet, show the lock screen
 if not st.session_state["app_unlocked"]:
-    st.error("🛑 Service Suspended")
+    st.error("🛑 Service Temporarily Suspended")
     st.info(
-        "### **This application has been shut down by the owner.**\n\n"
-        "Free promotional access for this resource has expired and the hosting limits "
+        "### **This app has been temporarily shut down by the owner.**\n\n"
+        "Free promotional access has expired and the hosting limits "
         "have been consumed.\n\n"
-        "To request access restoration, please contact **Muneeb** directly."
+        "To request access restoration, please contact **Hussaa1nn** directly."
     )
 
-    # Secret password field for you to unlock the app
+    # Hidden developer override
     secret_key = st.text_input("🔓 Developer Override Access:", type="password")
 
     if st.button("Verify Admin Access"):
@@ -43,12 +42,12 @@ if not st.session_state["app_unlocked"]:
         else:
             st.error("❌ Incorrect Admin Passkey.")
 
-    # Stop execution here so unauthorized users can't see the app features
+    # Halt here — unauthorised users never see the real app
     st.stop()
 
 
 # ---------------------------------------------------
-# HEADER (Will only run if you unlock it)
+# HEADER (Only runs after unlock)
 # ---------------------------------------------------
 col1, col2 = st.columns([1, 8])
 
@@ -60,7 +59,7 @@ with col1:
         st.write("🎙️")
 
 with col2:
-    st.title("WordWave")
+    st.title("Keep Laughing with Hussaa1nn")
     st.caption("Text-to-speech and audiobook generator (Developer Mode Active)")
 
 # ---------------------------------------------------
@@ -130,15 +129,9 @@ locale_display = {}
 
 for voice in voices:
     locale = voice["Locale"]
-    locale_display[locale] = LANGUAGE_MAP.get(
-        locale,
-        locale
-    )
+    locale_display[locale] = LANGUAGE_MAP.get(locale, locale)
 
-sorted_languages = sorted(
-    locale_display.items(),
-    key=lambda item: item[1]
-)
+sorted_languages = sorted(locale_display.items(), key=lambda item: item[1])
 
 language_choice = st.selectbox(
     "🌍 Select Language",
@@ -188,9 +181,7 @@ voice_map = {}
 
 for voice in filtered_voices:
     short_name = voice["ShortName"]
-    clean_name = short_name.split("-")[-1].replace(
-        "Neural", ""
-    ).strip()
+    clean_name = short_name.split("-")[-1].replace("Neural", "").strip()
 
     label = f"{clean_name} ({voice['Gender']})"
     voice_map[label] = short_name
@@ -201,10 +192,7 @@ if not voice_labels:
     st.warning("No voices found for this selection.")
     st.stop()
 
-voice_choice = st.selectbox(
-    "🎤 Select Voice",
-    voice_labels
-)
+voice_choice = st.selectbox("🎤 Select Voice", voice_labels)
 
 selected_voice = voice_map[voice_choice]
 
@@ -216,20 +204,10 @@ st.markdown("### 🎚️ Voice Settings")
 c1, c2 = st.columns(2)
 
 with c1:
-    speed = st.slider(
-        "⚡ Speed",
-        min_value=-50,
-        max_value=50,
-        value=0
-    )
+    speed = st.slider("⚡ Speed", min_value=-50, max_value=50, value=0)
 
 with c2:
-    pitch = st.slider(
-        "🎵 Pitch",
-        min_value=-50,
-        max_value=50,
-        value=0
-    )
+    pitch = st.slider("🎵 Pitch", min_value=-50, max_value=50, value=0)
 
 
 def format_rate(value):
@@ -238,6 +216,7 @@ def format_rate(value):
 
 def format_pitch(value):
     return f"{value:+d}Hz"
+
 
 # ---------------------------------------------------
 # SAMPLE VOICE PREVIEW
@@ -261,10 +240,7 @@ if st.button("▶ Play Sample Voice"):
     except Exception as e:
         st.error(f"Sample failed: {type(e).__name__}")
 
-        if isinstance(
-            e,
-            aiohttp.client_exceptions.WSServerHandshakeError
-        ):
+        if isinstance(e, aiohttp.client_exceptions.WSServerHandshakeError):
             st.error(f"Speech service HTTP status: {e.status}")
 
         print("Sample error:", repr(e))
@@ -280,13 +256,11 @@ def extract_text(uploaded_file):
 
     if extension == "pdf":
         pages = []
-
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text()
                 if page_text:
                     pages.append(page_text)
-
         return "\n\n".join(pages)
 
     if extension == "docx":
@@ -321,10 +295,7 @@ if "last_file_signature" not in st.session_state:
     st.session_state.last_file_signature = None
 
 if uploaded_file is not None:
-    signature = (
-        uploaded_file.name,
-        uploaded_file.size
-    )
+    signature = (uploaded_file.name, uploaded_file.size)
 
     if signature != st.session_state.last_file_signature:
         try:
@@ -335,7 +306,9 @@ if uploaded_file is not None:
         except Exception as file_error:
             st.error(f"Error reading file: {file_error}")
 
-# Text area box with the live counter stats right beneath it
+# ---------------------------------------------------
+# TEXT AREA + LIVE COUNTERS
+# ---------------------------------------------------
 text_to_speak = st.text_area(
     "Edit or type your text here:",
     value=st.session_state.edited_text,
@@ -346,7 +319,7 @@ text_to_speak = st.text_area(
 # Sync edits back to state
 st.session_state.edited_text = text_to_speak
 
-# 📊 COUNTER INFORMATION LAYOUT
+# 📊 COUNTER INFORMATION
 words_count = len(text_to_speak.split())
 chars_count = len(text_to_speak)
 sentences_count = len([
@@ -358,7 +331,6 @@ stat_col1, stat_col2, stat_col3 = st.columns(3)
 stat_col1.metric("Characters", chars_count)
 stat_col2.metric("Words", words_count)
 stat_col3.metric("Sentences", sentences_count)
-
 
 # ---------------------------------------------------
 # AUDIO GENERATION ENGINE PIPELINE
@@ -382,9 +354,9 @@ if st.button("🎙️ Generate Full Audio File", use_container_width=True):
     else:
         try:
             with st.spinner("Processing text pipelines and synthesizing voice files..."):
-                # Format options for Edge TTS API
-                rate_param = f"{speed:+d}%" if speed != 0 else "+0%"
-                pitch_param = f"{pitch:+d}Hz" if pitch != 0 else "+0Hz"
+                rate_param = format_rate(speed) if speed != 0 else "+0%"
+                pitch_param = format_pitch(pitch) if pitch != 0 else "+0Hz"
+
                 asyncio.run(
                     generate_full_audio(
                         text_to_speak,
