@@ -8,8 +8,10 @@ from docx import Document
 from pathlib import Path
 import time
 import os
-
-# Auto-detection imports
+import re
+import zipfile
+import io
+from pydub import AudioSegment
 import langdetect
 from langdetect import detect, LangDetectException
 
@@ -17,13 +19,13 @@ from langdetect import detect, LangDetectException
 # PAGE CONFIGURATION
 # ---------------------------------------------------
 st.set_page_config(
-    page_title="WordWave",
+    page_title="WordWave Studio",
     page_icon="🎙️",
     layout="wide"
 )
 
 # ---------------------------------------------------
-# 🔑 OWNER UNLOCK GATEWAY (Temporary Shutdown)
+# 🔑 OWNER UNLOCK GATEWAY
 # ---------------------------------------------------
 if "app_unlocked" not in st.session_state:
     st.session_state["app_unlocked"] = False
@@ -36,12 +38,10 @@ if not st.session_state["app_unlocked"]:
         "have been consumed.\n\n"
         "To request access restoration, please contact **Muneeb** directly."
     )
-    
     secret_key = st.text_input("🔓 Developer Override Access:", type="password")
     if st.button("Verify Admin Access"):
         if secret_key == "Ilovemuh@mm@d": 
             st.session_state["app_unlocked"] = True
-            st.success("✅ Access Granted! Loading your pipeline...")
             st.rerun()
         else:
             st.error("❌ Incorrect Admin Passkey.")
@@ -51,60 +51,33 @@ if not st.session_state["app_unlocked"]:
 # HEADER
 # ---------------------------------------------------
 col1, col2 = st.columns([1, 8])
-
 with col1:
     logo_path = Path("logo.png")
     if logo_path.exists():
         st.image(str(logo_path), width=120)
     else:
         st.write("🎙️")
-
 with col2:
-    st.title("WordWave")
-    st.caption("Text-to-speech and audiobook generator (Developer Mode Active)")
+    st.title("WordWave Studio")
+    st.caption("Professional Audiobook & Text-to-Speech Pipeline (Developer Mode Active)")
 
 # ---------------------------------------------------
-# LOAD VOICES
+# DATA & API SETUP
 # ---------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_voices():
-    async def get_voices():
-        return await edge_tts.list_voices()
-    return asyncio.run(get_voices())
+    return asyncio.run(edge_tts.list_voices())
 
-try:
-    with st.spinner("Loading voices..."):
-        voices = load_voices()
-except Exception as e:
-    st.error(f"Could not load voices: {type(e).__name__}")
-    st.stop()
+with st.spinner("Initializing Voice Engine..."):
+    voices = load_voices()
 
-if not voices:
-    st.error("No voices are currently available.")
-    st.stop()
-
-# ---------------------------------------------------
-# LANGUAGE MAP
-# ---------------------------------------------------
 LANGUAGE_MAP = {
-    "en-US": "English (United States)", "en-GB": "English (United Kingdom)",
-    "en-AU": "English (Australia)", "en-CA": "English (Canada)", "en-IN": "English (India)",
-    "ur-PK": "Urdu (Pakistan)", "hi-IN": "Hindi (India)", "ar-SA": "Arabic (Saudi Arabia)",
-    "tr-TR": "Turkish (Turkey)", "fr-FR": "French (France)", "de-DE": "German (Germany)",
-    "es-ES": "Spanish (Spain)", "it-IT": "Italian (Italy)", "pt-BR": "Portuguese (Brazil)",
-    "ru-RU": "Russian (Russia)", "ja-JP": "Japanese (Japan)", "ko-KR": "Korean (South Korea)",
-    "zh-CN": "Chinese (China)", "bn-BD": "Bengali (Bangladesh)", "fa-IR": "Persian (Iran)",
-    "id-ID": "Indonesian (Indonesia)", "ms-MY": "Malay (Malaysia)", "nl-NL": "Dutch (Netherlands)",
-    "pl-PL": "Polish (Poland)", "sv-SE": "Swedish (Sweden)", "ta-IN": "Tamil (India)",
-    "te-IN": "Telugu (India)", "th-TH": "Thai (Thailand)", "uk-UA": "Ukrainian (Ukraine)",
-    "vi-VN": "Vietnamese (Vietnam)"
+    "en-US": "English (US)", "en-GB": "English (UK)", "en-AU": "English (AU)", 
+    "ur-PK": "Urdu", "hi-IN": "Hindi", "ar-SA": "Arabic", "fr-FR": "French", 
+    "de-DE": "German", "es-ES": "Spanish", "zh-CN": "Chinese", "ja-JP": "Japanese"
 }
 
-# ---------------------------------------------------
-# 📄 TEXT INPUT & FILE EXTRACTION
-# ---------------------------------------------------
-st.markdown("### 📄 Text Input")
-
+# Helper function to extract text
 def extract_text(uploaded_file):
     extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
     if extension == "txt":
@@ -119,223 +92,221 @@ def extract_text(uploaded_file):
     if extension == "docx":
         document = Document(uploaded_file)
         return "\n".join(paragraph.text for paragraph in document.paragraphs)
-    if extension in ("xls", "xlsx"):
-        dataframe = pd.read_excel(uploaded_file)
-        return dataframe.to_string(index=False)
     return ""
 
-uploaded_file = st.file_uploader("Upload PDF, DOCX, TXT, XLS, or XLSX", type=["pdf", "docx", "txt", "xls", "xlsx"])
-
-if "edited_text" not in st.session_state:
-    st.session_state.edited_text = ""
-if "last_file_signature" not in st.session_state:
-    st.session_state.last_file_signature = None
-
-if uploaded_file is not None:
-    signature = (uploaded_file.name, uploaded_file.size)
-    if signature != st.session_state.last_file_signature:
-        try:
-            extracted_text = extract_text(uploaded_file)
-            st.session_state.edited_text = extracted_text
-            st.session_state.last_file_signature = signature
-        except Exception as file_error:
-            st.error(f"Error reading file: {file_error}")
-
-text_to_speak = st.text_area(
-    "Edit or type your text here:",
-    value=st.session_state.edited_text,
-    height=250,
-    key="text_area_input"
-)
-st.session_state.edited_text = text_to_speak
-
-# 📊 4 COUNTER METRICS
-words_count = len(text_to_speak.split())
-chars_count = len(text_to_speak)
-sentences_count = len([s for s in text_to_speak.replace('!', '.').replace('?', '.').split('.') if s.strip()])
-read_time_mins = round(words_count / 150, 1) if words_count > 0 else 0
-
-stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-stat_col1.metric("Characters", chars_count)
-stat_col2.metric("Words", words_count)
-stat_col3.metric("Sentences", sentences_count)
-stat_col4.metric("Est. Read Time", f"{read_time_mins} min")
-st.divider()
+# Helper for Async Generation
+async def generate_audio_async(text, voice, rate="+0%", pitch="+0Hz", submaker=None):
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+    audio_data = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_data += chunk["data"]
+        elif chunk["type"] == "WordBoundary" and submaker is not None:
+            submaker.feed(chunk)
+    return audio_data
 
 # ---------------------------------------------------
-# 🌍 LANGUAGE SELECTION & AUTO-DETECT
+# MAIN APP TABS
 # ---------------------------------------------------
-locale_display = {voice["Locale"]: LANGUAGE_MAP.get(voice["Locale"], voice["Locale"]) for voice in voices}
-sorted_languages = sorted(locale_display.items(), key=lambda item: item[1])
-available_locales = [loc for loc, name in sorted_languages]
+tab1, tab2, tab3 = st.tabs(["🎙️ Quick Voice", "🎭 Multi-Voice Dialogue", "📚 Audiobook Studio"])
 
-if "selected_lang" not in st.session_state:
-    st.session_state.selected_lang = sorted_languages[0][1]
-if "detect_msg" not in st.session_state:
-    st.session_state.detect_msg = None
-
-# Define the callback function (runs BEFORE the page renders)
-def detect_language_callback():
-    text = st.session_state.text_area_input
-    if not text.strip():
-        st.session_state.detect_msg = "warning|Please enter some text first."
-        return
+# ==========================================
+# TAB 1: QUICK VOICE (Single Voice)
+# ==========================================
+with tab1:
+    st.markdown("### 📄 Text Input")
     
-    try:
-        detected_code = detect(text[:1000])
-        matches = [loc for loc in available_locales if loc.startswith(detected_code)]
-        if matches:
-            defaults = {'en': 'en-US', 'ur': 'ur-PK', 'hi': 'hi-IN', 'zh': 'zh-CN', 'fr': 'fr-FR', 'es': 'es-ES', 'ar': 'ar-SA', 'pt': 'pt-BR'}
-            best_locale = defaults.get(detected_code) if defaults.get(detected_code) in matches else matches[0]
-            
-            display_name = next(label for code, label in sorted_languages if code == best_locale)
-            st.session_state.selected_lang = display_name
-            st.session_state.detect_msg = f"success|Detected: **{display_name}**"
+    uploaded_file = st.file_uploader("Upload Document", type=["pdf", "docx", "txt"], key="tab1_upload")
+    if "edited_text_1" not in st.session_state: st.session_state.edited_text_1 = ""
+    
+    if uploaded_file:
+        st.session_state.edited_text_1 = extract_text(uploaded_file)
+
+    text_to_speak = st.text_area("Edit text here:", value=st.session_state.edited_text_1, height=250, key="tab1_text")
+    st.session_state.edited_text_1 = text_to_speak
+
+    # 4 Metrics
+    words = len(text_to_speak.split())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Characters", len(text_to_speak))
+    c2.metric("Words", words)
+    c3.metric("Sentences", len([s for s in text_to_speak.replace('!', '.').replace('?', '.').split('.') if s.strip()]))
+    c4.metric("Est. Audio Time", f"{round(words/150, 1)} min")
+
+    st.divider()
+
+    # Language & Voice Selection
+    col_lang, col_voice = st.columns(2)
+    with col_lang:
+        lang_opts = sorted(list(set([v["Locale"] for v in voices])))
+        selected_locale = st.selectbox("🌍 Language", lang_opts, format_func=lambda x: LANGUAGE_MAP.get(x, x))
+    with col_voice:
+        filtered = [v for v in voices if v["Locale"] == selected_locale]
+        voice_names = [v["ShortName"].split("-")[-1].replace("Neural","") + f" ({v['Gender']})" for v in filtered]
+        selected_v_name = st.selectbox("🎤 Voice", voice_names)
+        selected_voice = filtered[voice_names.index(selected_v_name)]["ShortName"]
+
+    with st.expander("⚙️ Advanced Voice Settings"):
+        c_speed, c_pitch = st.columns(2)
+        speed = c_speed.slider("Speed", -50, 50, 0)
+        pitch = c_pitch.slider("Pitch", -50, 50, 0)
+
+    if st.button("🚀 Generate Audio", use_container_width=True, type="primary"):
+        if not text_to_speak.strip():
+            st.warning("Please enter text.")
         else:
-            st.session_state.detect_msg = f"warning|Language code '{detected_code}' detected, but no matching voice found."
-    except LangDetectException:
-        st.session_state.detect_msg = "error|Could not detect language. Please select manually."
+            start_time = time.time()
+            bar = st.progress(0, text="Generating...")
+            try:
+                audio_bytes = asyncio.run(generate_audio_async(text_to_speak, selected_voice, f"{speed:+d}%", f"{pitch:+d}Hz"))
+                bar.empty()
+                st.success(f"Generated in {round(time.time() - start_time, 2)}s")
+                st.audio(audio_bytes, format="audio/mp3")
+                st.download_button("⬇️ Download MP3", audio_bytes, "WordWave_Quick.mp3", "audio/mp3", use_container_width=True)
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-# UI Layout for Language & Button
-col_lang, col_btn = st.columns([3, 1])
+# ==========================================
+# TAB 2: MULTI-VOICE DIALOGUE
+# ==========================================
+with tab2:
+    st.markdown("### 🎭 Multi-Voice Dialogue Generator")
+    st.info("Format your text with character names in brackets. Example:\n\n**[Alex]:** Hello there!\n**[Sarah]:** Hi, how are you?")
+    
+    dialogue_text = st.text_area("Script:", height=200, placeholder="[Alex]: Hello!\n[Sarah]: Hi!")
+    
+    st.markdown("#### Assign Voices")
+    st.write("Match the names in your script to specific voices.")
+    
+    # Pre-defined mapping for simplicity
+    col_a, col_b = st.columns(2)
+    char_a = col_a.text_input("Character 1 Name", "Alex")
+    voice_a = col_a.selectbox("Voice for Character 1", [v["ShortName"] for v in voices if v["Locale"] == "en-US"], key="v_a")
+    
+    char_b = col_b.text_input("Character 2 Name", "Sarah")
+    voice_b = col_b.selectbox("Voice for Character 2", [v["ShortName"] for v in voices if v["Locale"] == "en-GB"], index=1, key="v_b")
 
-with col_lang:
-    language_choice = st.selectbox(
-        "🌍 Select Language",
-        [label for code, label in sorted_languages],
-        key="selected_lang"
-    )
+    if st.button("🚀 Generate Dialogue", use_container_width=True, type="primary"):
+        if not dialogue_text.strip():
+            st.warning("Please enter a script.")
+        else:
+            start_time = time.time()
+            bar = st.progress(0, text="Processing Script...")
+            
+            # Parse script
+            lines = [line.strip() for line in dialogue_text.split('\n') if line.strip()]
+            final_audio = AudioSegment.empty()
+            voice_map = {char_a.lower(): voice_a, char_b.lower(): voice_b}
+            default_voice = voice_a
 
-with col_btn:
-    st.write("") # Spacing
+            try:
+                for i, line in enumerate(lines):
+                    match = re.match(r"^\[(.*?)\]:\s*(.*)", line)
+                    if match:
+                        speaker = match.group(1).lower()
+                        text = match.group(2)
+                        voice = voice_map.get(speaker, default_voice)
+                    else:
+                        text = line
+                        voice = default_voice
+
+                    # Generate audio for line
+                    bar.progress(int((i/len(lines))*100), text=f"Generating line {i+1}...")
+                    audio_bytes = asyncio.run(generate_audio_async(text, voice))
+                    
+                    # Convert to pydub segment and append
+                    segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+                    final_audio += segment + AudioSegment.silent(duration=500) # 0.5s pause
+
+                # Export final combined audio
+                out_buffer = io.BytesIO()
+                final_audio.export(out_buffer, format="mp3")
+                bar.empty()
+                st.success(f"Dialogue generated in {round(time.time() - start_time, 2)}s!")
+                st.audio(out_buffer.getvalue(), format="audio/mp3")
+                st.download_button("⬇️ Download Dialogue MP3", out_buffer.getvalue(), "Dialogue.mp3", "audio/mp3", use_container_width=True)
+            except Exception as e:
+                st.error(f"Error mixing dialogue: {e}")
+
+# ==========================================
+# TAB 3: AUDIOBOOK STUDIO
+# ==========================================
+with tab3:
+    st.markdown("### 📚 Audiobook & Subtitle Studio")
+    
+    studio_text = st.text_area("Paste long text here (Max 50,000 characters):", height=200)
+    
+    with st.expander("🛠️ Studio Settings"):
+        st.markdown("**Audio & Subtitles**")
+        generate_srt = st.checkbox("Generate SRT Subtitles", value=True)
+        
+        st.markdown("**Background Music (Optional)**")
+        music_file = st.file_uploader("Upload Background Music (MP3)", type=["mp3"])
+        music_volume = st.slider("Music Volume Reduction (dB)", -30, -5, -15)
+        
+        st.markdown("**Text Cleanup**")
+        st.checkbox("Remove PDF line breaks (fixes weird pausing)", value=True, key="clean_pdf")
+
     st.write("")
-    # on_click executes the callback before the app re-renders
-    st.button("🔍 Auto-Detect Language", use_container_width=True, on_click=detect_language_callback)
-
-# Display the result message below the dropdown
-if st.session_state.detect_msg:
-    msg_type, msg_text = st.session_state.detect_msg.split("|", 1)
-    if msg_type == "success":
-        st.success(msg_text)
-    elif msg_type == "warning":
-        st.warning(msg_text)
-    else:
-        st.error(msg_text)
-
-# Resolve selected locale
-selected_locale = next(code for code, label in sorted_languages if label == language_choice)
-filtered_voices = [voice for voice in voices if voice["Locale"] == selected_locale]
-
-# ---------------------------------------------------
-# VOICE GENDER FILTER & SELECTION
-# ---------------------------------------------------
-if "gender_filter" not in st.session_state:
-    st.session_state.gender_filter = "All"
-
-g1, g2, g3 = st.columns(3)
-with g1:
-    if st.button("All Voices", use_container_width=True): st.session_state.gender_filter = "All"
-with g2:
-    if st.button("Male Voices", use_container_width=True): st.session_state.gender_filter = "Male"
-with g3:
-    if st.button("Female Voices", use_container_width=True): st.session_state.gender_filter = "Female"
-
-if st.session_state.gender_filter != "All":
-    filtered_voices = [v for v in filtered_voices if v["Gender"] == st.session_state.gender_filter]
-
-voice_map = {}
-for voice in filtered_voices:
-    short_name = voice["ShortName"]
-    clean_name = short_name.split("-")[-1].replace("Neural", "").strip()
-    voice_map[f"{clean_name} ({voice['Gender']})"] = short_name
-
-voice_labels = sorted(voice_map.keys())
-if not voice_labels:
-    st.warning("No voices found for this selection.")
-    st.stop()
-
-voice_choice = st.selectbox("🎤 Select Voice", voice_labels)
-selected_voice = voice_map[voice_choice]
-
-# ---------------------------------------------------
-# SPEED AND PITCH
-# ---------------------------------------------------
-st.markdown("### 🎚️ Voice Settings")
-c1, c2 = st.columns(2)
-with c1:
-    speed = st.slider("⚡ Speed", min_value=-50, max_value=50, value=0)
-with c2:
-    pitch = st.slider("🎵 Pitch", min_value=-50, max_value=50, value=0)
-
-def format_rate(value): return f"{value:+d}%"
-def format_pitch(value): return f"{value:+d}Hz"
-
-# ---------------------------------------------------
-# SAMPLE VOICE PREVIEW
-# ---------------------------------------------------
-async def create_sample():
-    communicate = edge_tts.Communicate(text="Hello, this is a sample voice preview.", voice=selected_voice)
-    await communicate.save("sample.mp3")
-
-if st.button("▶ Play Sample Voice"):
-    try:
-        with st.spinner("Generating sample..."):
-            asyncio.run(create_sample())
-        with open("sample.mp3", "rb") as sample_file:
-            st.audio(sample_file.read(), format="audio/mpeg")
-    except Exception as e:
-        st.error(f"Sample failed: {type(e).__name__}")
-
-# ---------------------------------------------------
-# 🚀 AUDIO GENERATION ENGINE PIPELINE
-# ---------------------------------------------------
-st.divider()
-st.markdown("### 🚀 Generate Full Audio")
-
-async def generate_full_audio(text, voice, rate_str, pitch_str):
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate_str, pitch=pitch_str)
-    await communicate.save("output.mp3")
-
-if st.button("🎙️ Generate Full Audio File", use_container_width=True, type="primary"):
-    if not text_to_speak.strip():
-        st.warning("Please provide text before running the voice generator pipeline.")
-    else:
-        try:
-            progress_text = "Synthesizing voice... Please wait."
-            my_bar = st.progress(0, text=progress_text)
+    if st.button("🏭 Start Audiobook Production", use_container_width=True, type="primary"):
+        if not studio_text.strip():
+            st.warning("Please enter text.")
+        else:
             start_time = time.time()
             
-            rate_param = format_rate(speed) if speed != 0 else "+0%"
-            pitch_param = format_pitch(pitch) if pitch != 0 else "+0Hz"
+            # 1. Text Cleanup
+            if st.session_state.clean_pdf:
+                studio_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', studio_text) # Fix single linebreaks
             
-            my_bar.progress(30, text="Processing text data...")
-            time.sleep(0.5) 
+            # 2. Chunking (Split by paragraph)
+            chunks = [p for p in studio_text.split('\n') if p.strip()]
             
-            my_bar.progress(60, text="Connecting to Speech Service...")
-            asyncio.run(generate_full_audio(text_to_speak, selected_voice, rate_param, pitch_param))
-            
-            my_bar.progress(100, text="Finalizing audio file...")
-            time.sleep(0.5)
-            
-            end_time = time.time()
-            duration = round(end_time - start_time, 2)
-            my_bar.empty()
-            
-            st.success(f"🎉 Audio generated successfully in **{duration} seconds**!")
-            
-            with open("output.mp3", "rb") as audio_file:
-                audio_data = audio_file.read()
+            bar = st.progress(0, text="Initializing Audio Engine...")
+            final_audio = AudioSegment.empty()
+            submaker = edge_tts.SubMaker() if generate_srt else None
+
+            try:
+                # 3. Loop and Generate
+                for i, chunk in enumerate(chunks):
+                    bar.progress(int((i/len(chunks))*100), text=f"Synthesizing chunk {i+1} of {len(chunks)}...")
+                    
+                    # Use default fast voice for chunks
+                    audio_bytes = asyncio.run(generate_audio_async(chunk, "en-US-ChristopherNeural", submaker=submaker))
+                    
+                    segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+                    final_audio += segment + AudioSegment.silent(duration=300)
+
+                # 4. Background Music Mixing
+                if music_file:
+                    bar.progress(90, text="Mixing Background Music...")
+                    music = AudioSegment.from_file(music_file, format="mp3")
+                    music = music - abs(music_volume) # Lower volume
+                    
+                    # Loop music if it's shorter than the audiobook
+                    if len(music) < len(final_audio):
+                        loops = (len(final_audio) // len(music)) + 1
+                        music = music * loops
+                    
+                    music = music[:len(final_audio)]
+                    final_audio = final_audio.overlay(music)
+
+                # 5. Export
+                bar.progress(95, text="Finalizing File...")
+                out_buffer = io.BytesIO()
+                final_audio.export(out_buffer, format="mp3", bitrate="192k")
                 
-            st.audio(audio_data, format="audio/mpeg")
-            
-            st.download_button(
-                label="⬇️ Download Audio File (.mp3)",
-                data=audio_data,
-                file_name="WordWave_Audio.mp3",
-                mime="audio/mpeg",
-                use_container_width=True
-            )
-            
-        except Exception as gen_err:
-            st.error(f"Pipeline Generation Failed: {type(gen_err).__name__}")
-            print("Full execution pipeline error details:", repr(gen_err))
+                bar.empty()
+                st.success(f"🎉 Audiobook Production Complete! (Took {round(time.time() - start_time, 1)}s)")
+                
+                # Show Audio & Download
+                st.audio(out_buffer.getvalue(), format="audio/mp3")
+                st.download_button("⬇️ Download Full Audiobook (MP3)", out_buffer.getvalue(), "Audiobook.mp3", "audio/mp3", use_container_width=True)
+                
+                # SRT Download
+                if generate_srt:
+                    srt_data = submaker.get_srt()
+                    if srt_data:
+                        st.download_button("⬇️ Download Subtitles (SRT)", srt_data, "Audiobook_Subtitles.srt", "text/plain", use_container_width=True)
+                        
+            except Exception as e:
+                st.error(f"Production Error: {e}")
