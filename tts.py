@@ -50,7 +50,7 @@ if not st.session_state["app_unlocked"]:
 # ---------------------------------------------------
 # HEADER (Will only run if you unlock it)
 # ---------------------------------------------------
-col1, col2 = st.columns([1, 8])
+col1, col2 = st.columns()
 
 with col1:
     logo_path = Path("logo.png")
@@ -137,7 +137,7 @@ for voice in voices:
 
 sorted_languages = sorted(
     locale_display.items(),
-    key=lambda item: item[1]
+    key=lambda item: item
 )
 
 language_choice = st.selectbox(
@@ -333,3 +333,5 @@ if uploaded_file is not None:
             st.session_state.edited_text = extracted_text
             st.session_state.last_file_signature = signature
             st.session_state.text_editor = extracted_text
+        except Exception as file_error:
+            st.error(f"Error reading file: {file_error}")
