@@ -50,7 +50,8 @@ if not st.session_state["app_unlocked"]:
 # ---------------------------------------------------
 # HEADER (Will only run if you unlock it)
 # ---------------------------------------------------
-col1, col2 = st.columns()
+# FIXED: Added [1, 8] back inside columns to stop the layout crash
+col1, col2 = st.columns([1, 8])
 
 with col1:
     logo_path = Path("logo.png")
