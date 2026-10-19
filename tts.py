@@ -9,6 +9,10 @@ from pathlib import Path
 import time
 import os
 
+# New import for Auto-Detection
+import langdetect
+from langdetect import detect, LangDetectException
+
 # ---------------------------------------------------
 # PAGE CONFIGURATION
 # ---------------------------------------------------
@@ -33,9 +37,7 @@ if not st.session_state["app_unlocked"]:
         "To request access restoration, please contact **Muneeb** directly."
     )
     
-    # Secret password field for you to unlock the app
     secret_key = st.text_input("🔓 Developer Override Access:", type="password")
-    
     if st.button("Verify Admin Access"):
         if secret_key == "Ilovemuh@mm@d": 
             st.session_state["app_unlocked"] = True
@@ -43,12 +45,10 @@ if not st.session_state["app_unlocked"]:
             st.rerun()
         else:
             st.error("❌ Incorrect Admin Passkey.")
-            
     st.stop()
 
-
 # ---------------------------------------------------
-# HEADER (Only runs if unlocked)
+# HEADER
 # ---------------------------------------------------
 col1, col2 = st.columns([1, 8])
 
@@ -70,7 +70,6 @@ with col2:
 def load_voices():
     async def get_voices():
         return await edge_tts.list_voices()
-
     return asyncio.run(get_voices())
 
 try:
@@ -78,8 +77,6 @@ try:
         voices = load_voices()
 except Exception as e:
     st.error(f"Could not load voices: {type(e).__name__}")
-    st.info("Check the Streamlit Cloud logs and try again.")
-    print("Voice loading error:", repr(e))
     st.stop()
 
 if not voices:
@@ -104,48 +101,142 @@ LANGUAGE_MAP = {
 }
 
 # ---------------------------------------------------
-# LANGUAGE SELECTION
+# 📄 TEXT INPUT & FILE EXTRACTION (Moved to Top)
 # ---------------------------------------------------
-locale_display = {}
-for voice in voices:
-    locale_display[voice["Locale"]] = LANGUAGE_MAP.get(voice["Locale"], voice["Locale"])
+st.markdown("### 📄 Text Input")
 
+def extract_text(uploaded_file):
+    extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
+    if extension == "txt":
+        return uploaded_file.getvalue().decode("utf-8-sig")
+    if extension == "pdf":
+        pages = []
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text: pages.append(page_text)
+        return "\n\n".join(pages)
+    if extension == "docx":
+        document = Document(uploaded_file)
+        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+    if extension in ("xls", "xlsx"):
+        dataframe = pd.read_excel(uploaded_file)
+        return dataframe.to_string(index=False)
+    return ""
+
+uploaded_file = st.file_uploader("Upload PDF, DOCX, TXT, XLS, or XLSX", type=["pdf", "docx", "txt", "xls", "xlsx"])
+
+if "edited_text" not in st.session_state:
+    st.session_state.edited_text = ""
+if "last_file_signature" not in st.session_state:
+    st.session_state.last_file_signature = None
+
+if uploaded_file is not None:
+    signature = (uploaded_file.name, uploaded_file.size)
+    if signature != st.session_state.last_file_signature:
+        try:
+            extracted_text = extract_text(uploaded_file)
+            st.session_state.edited_text = extracted_text
+            st.session_state.last_file_signature = signature
+        except Exception as file_error:
+            st.error(f"Error reading file: {file_error}")
+
+text_to_speak = st.text_area(
+    "Edit or type your text here:",
+    value=st.session_state.edited_text,
+    height=250,
+    key="text_area_input"
+)
+st.session_state.edited_text = text_to_speak
+
+# 📊 4 COUNTER METRICS
+words_count = len(text_to_speak.split())
+chars_count = len(text_to_speak)
+sentences_count = len([s for s in text_to_speak.replace('!', '.').replace('?', '.').split('.') if s.strip()])
+read_time_mins = round(words_count / 150, 1) if words_count > 0 else 0
+
+stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+stat_col1.metric("Characters", chars_count)
+stat_col2.metric("Words", words_count)
+stat_col3.metric("Sentences", sentences_count)
+stat_col4.metric("Est. Read Time", f"{read_time_mins} min")
+st.divider()
+
+# ---------------------------------------------------
+# 🌍 LANGUAGE SELECTION & AUTO-DETECT
+# ---------------------------------------------------
+locale_display = {voice["Locale"]: LANGUAGE_MAP.get(voice["Locale"], voice["Locale"]) for voice in voices}
 sorted_languages = sorted(locale_display.items(), key=lambda item: item[1])
+available_locales = [loc for loc, name in sorted_languages]
 
-language_choice = st.selectbox("🌍 Select Language", [label for code, label in sorted_languages])
-selected_locale = next(code for code, label in sorted_languages if label == language_choice)
+# Initialize session state for the dropdown
+if "selected_lang" not in st.session_state:
+    st.session_state.selected_lang = sorted_languages[0][1]
 
+# Callback logic for auto-detection
+col_lang, col_btn = st.columns([3, 1])
+
+with col_lang:
+    language_choice = st.selectbox(
+        "🌍 Select Language",
+        [label for code, label in sorted_languages],
+        key="selected_lang"
+    )
+
+with col_btn:
+    st.write("") # Spacing to push button down slightly
+    st.write("")
+    if st.button("🔍 Auto-Detect Language", use_container_width=True):
+        if not text_to_speak.strip():
+            st.warning("Please enter some text first.")
+        else:
+            try:
+                # Detect language using first 1000 chars for speed
+                detected_code = detect(text_to_speak[:1000])
+                
+                # Find matching Edge-TTS locale
+                matches = [loc for loc in available_locales if loc.startswith(detected_code)]
+                if matches:
+                    # Default preference overrides (e.g., 'en' -> 'en-US', 'ur' -> 'ur-PK')
+                    defaults = {'en': 'en-US', 'ur': 'ur-PK', 'hi': 'hi-IN', 'zh': 'zh-CN', 'fr': 'fr-FR', 'es': 'es-ES', 'ar': 'ar-SA', 'pt': 'pt-BR'}
+                    best_locale = defaults.get(detected_code) if defaults.get(detected_code) in matches else matches[0]
+                    
+                    # Update the dropdown state
+                    display_name = next(label for code, label in sorted_languages if code == best_locale)
+                    st.session_state.selected_lang = display_name
+                    st.success(f"Detected: **{display_name}**")
+                    st.rerun()
+                else:
+                    st.warning(f"Language code '{detected_code}' detected, but no matching voice found.")
+            except LangDetectException:
+                st.error("Could not detect language. Please select manually.")
+
+# Resolve the selected locale for voice filtering
+selected_locale = next(code for code, label in sorted_languages if label == st.session_state.selected_lang)
 filtered_voices = [voice for voice in voices if voice["Locale"] == selected_locale]
 
 # ---------------------------------------------------
-# VOICE GENDER FILTER
+# VOICE GENDER FILTER & SELECTION
 # ---------------------------------------------------
 if "gender_filter" not in st.session_state:
     st.session_state.gender_filter = "All"
 
 g1, g2, g3 = st.columns(3)
 with g1:
-    if st.button("All Voices", use_container_width=True):
-        st.session_state.gender_filter = "All"
+    if st.button("All Voices", use_container_width=True): st.session_state.gender_filter = "All"
 with g2:
-    if st.button("Male Voices", use_container_width=True):
-        st.session_state.gender_filter = "Male"
+    if st.button("Male Voices", use_container_width=True): st.session_state.gender_filter = "Male"
 with g3:
-    if st.button("Female Voices", use_container_width=True):
-        st.session_state.gender_filter = "Female"
+    if st.button("Female Voices", use_container_width=True): st.session_state.gender_filter = "Female"
 
 if st.session_state.gender_filter != "All":
     filtered_voices = [v for v in filtered_voices if v["Gender"] == st.session_state.gender_filter]
 
-# ---------------------------------------------------
-# VOICE SELECTION
-# ---------------------------------------------------
 voice_map = {}
 for voice in filtered_voices:
     short_name = voice["ShortName"]
     clean_name = short_name.split("-")[-1].replace("Neural", "").strip()
-    label = f"{clean_name} ({voice['Gender']})"
-    voice_map[label] = short_name
+    voice_map[f"{clean_name} ({voice['Gender']})"] = short_name
 
 voice_labels = sorted(voice_map.keys())
 if not voice_labels:
@@ -183,115 +274,33 @@ if st.button("▶ Play Sample Voice"):
             st.audio(sample_file.read(), format="audio/mpeg")
     except Exception as e:
         st.error(f"Sample failed: {type(e).__name__}")
-        if isinstance(e, aiohttp.client_exceptions.WSServerHandshakeError):
-            st.error(f"Speech service HTTP status: {e.status}")
 
 # ---------------------------------------------------
-# FILE TEXT EXTRACTION
+# 🚀 AUDIO GENERATION ENGINE PIPELINE
 # ---------------------------------------------------
-def extract_text(uploaded_file):
-    extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
-    if extension == "txt":
-        return uploaded_file.getvalue().decode("utf-8-sig")
-    if extension == "pdf":
-        pages = []
-        with pdfplumber.open(uploaded_file) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    pages.append(page_text)
-        return "\n\n".join(pages)
-    if extension == "docx":
-        document = Document(uploaded_file)
-        return "\n".join(paragraph.text for paragraph in document.paragraphs)
-    if extension in ("xls", "xlsx"):
-        dataframe = pd.read_excel(uploaded_file)
-        return dataframe.to_string(index=False)
-    return ""
-
-# ---------------------------------------------------
-# TEXT INPUT OR FILE UPLOAD
-# ---------------------------------------------------
-st.markdown("### 📄 Text Input")
-
-uploaded_file = st.file_uploader("Upload PDF, DOCX, TXT, XLS, or XLSX", type=["pdf", "docx", "txt", "xls", "xlsx"])
-
-if "edited_text" not in st.session_state:
-    st.session_state.edited_text = ""
-if "last_file_signature" not in st.session_state:
-    st.session_state.last_file_signature = None
-
-if uploaded_file is not None:
-    signature = (uploaded_file.name, uploaded_file.size)
-    if signature != st.session_state.last_file_signature:
-        try:
-            extracted_text = extract_text(uploaded_file)
-            st.session_state.edited_text = extracted_text
-            st.session_state.last_file_signature = signature
-        except Exception as file_error:
-            st.error(f"Error reading file: {file_error}")
-
-# Text area box
-text_to_speak = st.text_area(
-    "Edit or type your text here:",
-    value=st.session_state.edited_text,
-    height=300,
-    key="text_area_input"
-)
-
-# Sync edits back to state
-st.session_state.edited_text = text_to_speak
-
-# ---------------------------------------------------
-# 📊 4 COUNTER METRICS (Top Section)
-# ---------------------------------------------------
-words_count = len(text_to_speak.split())
-chars_count = len(text_to_speak)
-sentences_count = len([s for s in text_to_speak.replace('!', '.').replace('?', '.').split('.') if s.strip()])
-read_time_mins = round(words_count / 150, 1) if words_count > 0 else 0
-
-stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-stat_col1.metric("Characters", chars_count)
-stat_col2.metric("Words", words_count)
-stat_col3.metric("Sentences", sentences_count)
-stat_col4.metric("Est. Read Time", f"{read_time_mins} min")
-
-# ---------------------------------------------------
-# AUDIO GENERATION ENGINE PIPELINE
-# ---------------------------------------------------
+st.divider()
 st.markdown("### 🚀 Generate Full Audio")
 
 async def generate_full_audio(text, voice, rate_str, pitch_str):
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice=voice,
-        rate=rate_str,
-        pitch=pitch_str
-    )
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate_str, pitch=pitch_str)
     await communicate.save("output.mp3")
 
-# Using type="primary" creates the red/pink button seen in standard Streamlit themes
 if st.button("🎙️ Generate Full Audio File", use_container_width=True, type="primary"):
     if not text_to_speak.strip():
         st.warning("Please provide text before running the voice generator pipeline.")
     else:
         try:
-            # Setup for progress bar and timing
             progress_text = "Synthesizing voice... Please wait."
             my_bar = st.progress(0, text=progress_text)
-            
             start_time = time.time()
             
             rate_param = format_rate(speed) if speed != 0 else "+0%"
             pitch_param = format_pitch(pitch) if pitch != 0 else "+0Hz"
             
-            # Artificial progress updates to give user feedback
-            my_bar.progress(25, text="Processing text...")
+            my_bar.progress(30, text="Processing text data...")
             time.sleep(0.5) 
             
-            my_bar.progress(50, text="Connecting to Speech Service...")
-            
-            # Run the async generation function
+            my_bar.progress(60, text="Connecting to Speech Service...")
             asyncio.run(generate_full_audio(text_to_speak, selected_voice, rate_param, pitch_param))
             
             my_bar.progress(100, text="Finalizing audio file...")
@@ -299,20 +308,15 @@ if st.button("🎙️ Generate Full Audio File", use_container_width=True, type=
             
             end_time = time.time()
             duration = round(end_time - start_time, 2)
-            
-            # Clear progress bar upon completion
             my_bar.empty()
             
             st.success(f"🎉 Audio generated successfully in **{duration} seconds**!")
             
-            # Read generated audio
             with open("output.mp3", "rb") as audio_file:
                 audio_data = audio_file.read()
                 
-            # Show Audio Player
             st.audio(audio_data, format="audio/mpeg")
             
-            # Show Download Link
             st.download_button(
                 label="⬇️ Download Audio File (.mp3)",
                 data=audio_data,
