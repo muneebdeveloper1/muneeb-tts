@@ -1,4 +1,3 @@
-
 import streamlit as st
 import asyncio
 import edge_tts
@@ -12,13 +11,44 @@ from pathlib import Path
 # PAGE CONFIGURATION
 # ---------------------------------------------------
 st.set_page_config(
-    page_title="Keep Laughing Voice Generator",
+    page_title="WordWave",
     page_icon="🎙️",
     layout="wide"
 )
 
 # ---------------------------------------------------
-# HEADER
+# 🔑 SECRET OWNER UNLOCK GATEWAY
+# ---------------------------------------------------
+if "app_unlocked" not in st.session_state:
+    st.session_state["app_unlocked"] = False
+
+# If the app is not unlocked yet, show the lock screen
+if not st.session_state["app_unlocked"]:
+    st.error("🛑 Service Suspended")
+    st.info(
+        "### **This application has been shut down by the owner.**\n\n"
+        "Free promotional access for this resource has expired and the hosting limits "
+        "have been consumed.\n\n"
+        "To request access restoration, please contact **Muneeb** directly."
+    )
+    
+    # Secret password field for you to unlock the app
+    secret_key = st.text_input("🔓 Developer Override Access:", type="password")
+    
+    if st.button("Verify Admin Access"):
+        if secret_key == "Ilovemuh@mm@d": 
+            st.session_state["app_unlocked"] = True
+            st.success("✅ Access Granted! Loading your pipeline...")
+            st.rerun()
+        else:
+            st.error("❌ Incorrect Admin Passkey.")
+            
+    # Stop execution here so unauthorized users can't see the app features
+    st.stop()
+
+
+# ---------------------------------------------------
+# HEADER (Will only run if you unlock it)
 # ---------------------------------------------------
 col1, col2 = st.columns([1, 8])
 
@@ -30,8 +60,8 @@ with col1:
         st.write("🎙️")
 
 with col2:
-    st.title("Keep Laughing with Hussaa1nn")
-    st.caption("Text-to-speech and audiobook generator")
+    st.title("WordWave")
+    st.caption("Text-to-speech and audiobook generator (Developer Mode Active)")
 
 # ---------------------------------------------------
 # LOAD VOICES
@@ -303,145 +333,3 @@ if uploaded_file is not None:
             st.session_state.edited_text = extracted_text
             st.session_state.last_file_signature = signature
             st.session_state.text_editor = extracted_text
-
-        except Exception as e:
-            st.error(f"File reading failed: {type(e).__name__}")
-            print("File extraction error:", repr(e))
-            st.stop()
-
-    st.info(f"File loaded: {uploaded_file.name}")
-
-    st.caption("Edit the extracted text before generating audio.")
-
-    if "text_editor" not in st.session_state:
-        st.session_state.text_editor = st.session_state.edited_text
-
-    final_text = st.text_area(
-        "Edit extracted text",
-        height=350,
-        key="text_editor"
-    )
-
-    st.session_state.edited_text = final_text
-
-    b1, b2 = st.columns(2)
-
-    with b1:
-        if st.button("🔄 Reset to Original", use_container_width=True):
-            st.session_state.text_editor = st.session_state.original_text
-            st.session_state.edited_text = st.session_state.original_text
-            st.rerun()
-
-    with b2:
-        if st.button("🗑 Clear All", use_container_width=True):
-            st.session_state.text_editor = ""
-            st.session_state.edited_text = ""
-            st.rerun()
-
-else:
-    final_text = st.text_area(
-        "Paste your text",
-        height=250,
-        key="pasted_text",
-        placeholder="Enter the text you want to convert to speech..."
-    )
-
-# ---------------------------------------------------
-# TEXT STATISTICS
-# ---------------------------------------------------
-st.markdown("### 📊 Text Statistics")
-
-characters = len(final_text)
-words = len(final_text.split())
-
-sentences = len([
-    item for item in (
-        final_text.replace("!", ".")
-        .replace("?", ".")
-        .split(".")
-    )
-    if item.strip()
-])
-
-paragraphs = len([
-    item for item in final_text.split("\n\n")
-    if item.strip()
-])
-
-lines = len([
-    item for item in final_text.splitlines()
-    if item.strip()
-])
-
-s1, s2, s3, s4, s5 = st.columns(5)
-
-s1.metric("Characters", characters)
-s2.metric("Words", words)
-s3.metric("Sentences", sentences)
-s4.metric("Paragraphs", paragraphs)
-s5.metric("Lines", lines)
-
-# ---------------------------------------------------
-# AUDIO GENERATION
-# ---------------------------------------------------
-OUTPUT_FILE = "output.mp3"
-
-
-async def generate_audio():
-    communicate = edge_tts.Communicate(
-        text=final_text,
-        voice=selected_voice,
-        rate=format_rate(speed),
-        pitch=format_pitch(pitch)
-    )
-
-    await communicate.save(OUTPUT_FILE)
-
-# ---------------------------------------------------
-# GENERATE AUDIO BUTTON
-# ---------------------------------------------------
-if st.button(
-    "🚀 Generate Audiobook",
-    type="primary",
-    use_container_width=True
-):
-    if not final_text.strip():
-        st.warning("Please enter text or upload a file first.")
-
-    else:
-        try:
-            with st.spinner("Generating audio... Please wait."):
-                asyncio.run(generate_audio())
-
-            with open(OUTPUT_FILE, "rb") as audio_file:
-                audio_bytes = audio_file.read()
-
-            st.success("Audio generated successfully! 🎧")
-            st.audio(audio_bytes, format="audio/mpeg")
-
-            st.download_button(
-                label="⬇️ Download MP3",
-                data=audio_bytes,
-                file_name="audiobook.mp3",
-                mime="audio/mpeg",
-                use_container_width=True
-            )
-
-        except aiohttp.client_exceptions.WSServerHandshakeError as e:
-            st.error("The speech service rejected the connection.")
-            st.error(f"HTTP status: {e.status}")
-            st.info(
-                "This is a speech-service connection issue. "
-                "Check the Streamlit Cloud logs for details."
-            )
-            print("TTS handshake error:", repr(e))
-
-        except aiohttp.ClientError as e:
-            st.error("Could not connect to the speech service.")
-            st.write(f"Error type: {type(e).__name__}")
-            print("TTS network error:", repr(e))
-
-        except Exception as e:
-            st.error(f"Audio generation failed: {type(e).__name__}")
-            st.info("Open the Streamlit Cloud logs for the full error.")
-            print("TTS generation error:", repr(e))
