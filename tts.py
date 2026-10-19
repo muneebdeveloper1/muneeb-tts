@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 import os
 
-# New import for Auto-Detection
+# Auto-detection imports
 import langdetect
 from langdetect import detect, LangDetectException
 
@@ -101,7 +101,7 @@ LANGUAGE_MAP = {
 }
 
 # ---------------------------------------------------
-# 📄 TEXT INPUT & FILE EXTRACTION (Moved to Top)
+# 📄 TEXT INPUT & FILE EXTRACTION
 # ---------------------------------------------------
 st.markdown("### 📄 Text Input")
 
@@ -169,11 +169,34 @@ locale_display = {voice["Locale"]: LANGUAGE_MAP.get(voice["Locale"], voice["Loca
 sorted_languages = sorted(locale_display.items(), key=lambda item: item[1])
 available_locales = [loc for loc, name in sorted_languages]
 
-# Initialize session state for the dropdown
 if "selected_lang" not in st.session_state:
     st.session_state.selected_lang = sorted_languages[0][1]
+if "detect_msg" not in st.session_state:
+    st.session_state.detect_msg = None
 
-# Callback logic for auto-detection
+# Define the callback function (runs BEFORE the page renders)
+def detect_language_callback():
+    text = st.session_state.text_area_input
+    if not text.strip():
+        st.session_state.detect_msg = "warning|Please enter some text first."
+        return
+    
+    try:
+        detected_code = detect(text[:1000])
+        matches = [loc for loc in available_locales if loc.startswith(detected_code)]
+        if matches:
+            defaults = {'en': 'en-US', 'ur': 'ur-PK', 'hi': 'hi-IN', 'zh': 'zh-CN', 'fr': 'fr-FR', 'es': 'es-ES', 'ar': 'ar-SA', 'pt': 'pt-BR'}
+            best_locale = defaults.get(detected_code) if defaults.get(detected_code) in matches else matches[0]
+            
+            display_name = next(label for code, label in sorted_languages if code == best_locale)
+            st.session_state.selected_lang = display_name
+            st.session_state.detect_msg = f"success|Detected: **{display_name}**"
+        else:
+            st.session_state.detect_msg = f"warning|Language code '{detected_code}' detected, but no matching voice found."
+    except LangDetectException:
+        st.session_state.detect_msg = "error|Could not detect language. Please select manually."
+
+# UI Layout for Language & Button
 col_lang, col_btn = st.columns([3, 1])
 
 with col_lang:
@@ -184,35 +207,23 @@ with col_lang:
     )
 
 with col_btn:
-    st.write("") # Spacing to push button down slightly
+    st.write("") # Spacing
     st.write("")
-    if st.button("🔍 Auto-Detect Language", use_container_width=True):
-        if not text_to_speak.strip():
-            st.warning("Please enter some text first.")
-        else:
-            try:
-                # Detect language using first 1000 chars for speed
-                detected_code = detect(text_to_speak[:1000])
-                
-                # Find matching Edge-TTS locale
-                matches = [loc for loc in available_locales if loc.startswith(detected_code)]
-                if matches:
-                    # Default preference overrides (e.g., 'en' -> 'en-US', 'ur' -> 'ur-PK')
-                    defaults = {'en': 'en-US', 'ur': 'ur-PK', 'hi': 'hi-IN', 'zh': 'zh-CN', 'fr': 'fr-FR', 'es': 'es-ES', 'ar': 'ar-SA', 'pt': 'pt-BR'}
-                    best_locale = defaults.get(detected_code) if defaults.get(detected_code) in matches else matches[0]
-                    
-                    # Update the dropdown state
-                    display_name = next(label for code, label in sorted_languages if code == best_locale)
-                    st.session_state.selected_lang = display_name
-                    st.success(f"Detected: **{display_name}**")
-                    st.rerun()
-                else:
-                    st.warning(f"Language code '{detected_code}' detected, but no matching voice found.")
-            except LangDetectException:
-                st.error("Could not detect language. Please select manually.")
+    # on_click executes the callback before the app re-renders
+    st.button("🔍 Auto-Detect Language", use_container_width=True, on_click=detect_language_callback)
 
-# Resolve the selected locale for voice filtering
-selected_locale = next(code for code, label in sorted_languages if label == st.session_state.selected_lang)
+# Display the result message below the dropdown
+if st.session_state.detect_msg:
+    msg_type, msg_text = st.session_state.detect_msg.split("|", 1)
+    if msg_type == "success":
+        st.success(msg_text)
+    elif msg_type == "warning":
+        st.warning(msg_text)
+    else:
+        st.error(msg_text)
+
+# Resolve selected locale
+selected_locale = next(code for code, label in sorted_languages if label == language_choice)
 filtered_voices = [voice for voice in voices if voice["Locale"] == selected_locale]
 
 # ---------------------------------------------------
