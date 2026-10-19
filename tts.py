@@ -31,18 +31,18 @@ if not st.session_state["app_unlocked"]:
         "have been consumed.\n\n"
         "To request access restoration, please contact **Muneeb** directly."
     )
-    
+
     # Secret password field for you to unlock the app
     secret_key = st.text_input("🔓 Developer Override Access:", type="password")
-    
+
     if st.button("Verify Admin Access"):
-        if secret_key == "Ilovemuh@mm@d": 
+        if secret_key == "Ilovemuh@mm@d":
             st.session_state["app_unlocked"] = True
             st.success("✅ Access Granted! Loading your pipeline...")
             st.rerun()
         else:
             st.error("❌ Incorrect Admin Passkey.")
-            
+
     # Stop execution here so unauthorized users can't see the app features
     st.stop()
 
@@ -349,43 +349,56 @@ st.session_state.edited_text = text_to_speak
 # 📊 COUNTER INFORMATION LAYOUT
 words_count = len(text_to_speak.split())
 chars_count = len(text_to_speak)
-sentences_count = len([s for s in text_to_speak.replace('!', '.').replace('?', '.').split('.') if s.strip()])
+sentences_count = len([
+    s for s in text_to_speak.replace("!", ".").replace("?", ".").split(".")
+    if s.strip()
+])
 
 stat_col1, stat_col2, stat_col3 = st.columns(3)
 stat_col1.metric("Characters", chars_count)
 stat_col2.metric("Words", words_count)
 stat_col3.metric("Sentences", sentences_count)
 
----------------------------------------------------
 
-
-AUDIO GENERATION ENGINE PIPELINE
-
-
----------------------------------------------------
-
+# ---------------------------------------------------
+# AUDIO GENERATION ENGINE PIPELINE
+# ---------------------------------------------------
 st.markdown("### 🚀 Generate Full Audio")
+
+
 async def generate_full_audio(text, voice, rate_str, pitch_str):
-communicate = edge_tts.Communicate(
-text=text,
-voice=voice,
-rate=rate_str,
-pitch=pitch_str
-)
-await communicate.save("output.mp3")
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice=voice,
+        rate=rate_str,
+        pitch=pitch_str
+    )
+    await communicate.save("output.mp3")
+
+
 if st.button("🎙️ Generate Full Audio File", use_container_width=True):
-if not text_to_speak.strip():
-st.warning("Please provide text before running the voice generator pipeline.")
-else:
-try:
-with st.spinner("Processing text pipelines and synthesizing voice files..."):
-# Format options for Edge TTS API
-rate_param = f"{speed:+d}%" if speed != 0 else "+0%"
-pitch_param = f"{pitch:+d}Hz" if pitch != 0 else "+0Hz"
-asyncio.run(generate_full_audio(text_to_speak, selected_voice, rate_param, pitch_param))
-st.success("🎉 Audio generated successfully!")
-with open("output.mp3", "rb") as audio_file:
-st.audio(audio_file.read(), format="audio/mpeg")
-except Exception as gen_err:
-st.error(f"Pipeline Generation Failed: {type(gen_err).name}")
-print("Full execution pipeline error details:", repr(gen_err))
+    if not text_to_speak.strip():
+        st.warning("Please provide text before running the voice generator pipeline.")
+    else:
+        try:
+            with st.spinner("Processing text pipelines and synthesizing voice files..."):
+                # Format options for Edge TTS API
+                rate_param = f"{speed:+d}%" if speed != 0 else "+0%"
+                pitch_param = f"{pitch:+d}Hz" if pitch != 0 else "+0Hz"
+                asyncio.run(
+                    generate_full_audio(
+                        text_to_speak,
+                        selected_voice,
+                        rate_param,
+                        pitch_param
+                    )
+                )
+
+            st.success("🎉 Audio generated successfully!")
+
+            with open("output.mp3", "rb") as audio_file:
+                st.audio(audio_file.read(), format="audio/mpeg")
+
+        except Exception as gen_err:
+            st.error(f"Pipeline Generation Failed: {type(gen_err).__name__}")
+            print("Full execution pipeline error details:", repr(gen_err))
