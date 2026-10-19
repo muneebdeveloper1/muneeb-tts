@@ -98,7 +98,6 @@ def extract_text(uploaded_file):
         return "\n".join(paragraph.text for paragraph in document.paragraphs)
     return ""
 
-# OPTIMIZED: Using bytearray instead of bytes for lightning-fast concatenation
 async def generate_audio_async(text, voice, rate="+0%", pitch="+0Hz", submaker=None):
     communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     audio_buffer = bytearray()
@@ -202,19 +201,22 @@ with tab1:
         if not text_to_speak.strip():
             st.warning("Please provide text before generating.")
         else:
+            status_box = st.empty() # Placeholder for text underneath button
             start_time = time.time()
-            bar = st.progress(0, text="Synthesizing...")
             try:
-                bar.progress(40, text="Connecting...")
+                status_box.info("Audio creating... 20% done")
+                # Simulate steps for UI feedback
+                status_box.info("Audio creating... 50% done")
                 audio_bytes = asyncio.run(generate_audio_async(text_to_speak, selected_voice_t1, f"{speed_t1:+d}%", f"{pitch_t1:+d}Hz"))
-                bar.progress(100, text="Finalizing...")
-                bar.empty()
+                
+                status_box.success("Audio creating... 100% done. **Created!**")
                 
                 duration = round(time.time() - start_time, 2)
-                st.success(f"🎉 Audio generated successfully in **{duration} seconds**!")
+                st.caption(f"⏱️ Generated in {duration} seconds")
                 st.audio(audio_bytes, format="audio/mp3")
                 st.download_button("⬇️ Download MP3", audio_bytes, "WordWave_Quick.mp3", "audio/mp3", use_container_width=True)
             except Exception as e:
+                status_box.empty()
                 st.error(f"Generation Failed: {e}")
 
 # ==========================================
@@ -256,8 +258,8 @@ with tab2:
         if not dialogue_text.strip():
             st.warning("Please enter a script.")
         else:
+            status_box = st.empty() # Placeholder under button
             start_time = time.time()
-            bar = st.progress(0, text="Processing Script...")
             
             lines = [line.strip() for line in dialogue_text.split('\n') if line.strip()]
             audio_chunks = []
@@ -274,26 +276,21 @@ with tab2:
                         text = line
                         voice = default_voice
 
-                    bar.progress(int((idx/len(lines))*100), text=f"Generating line {idx+1}...")
+                    percent = int(((idx + 1) / len(lines)) * 100)
+                    status_box.info(f"Audio creating... **{percent}%** done")
+                    
                     chunk_bytes = asyncio.run(generate_audio_async(text, voice))
                     audio_chunks.append(chunk_bytes)
 
-                bar.progress(90, text="Merging Audio...")
-                
-                # OPTIMIZATION: Join raw MP3 bytes natively instead of using pydub loop
                 combined_audio = b"".join(audio_chunks)
                 
-                # Only load into pydub once to fix potential glitches and add a clean export
-                final_segment = AudioSegment.from_file(io.BytesIO(combined_audio), format="mp3")
-                out_buffer = io.BytesIO()
-                final_segment.export(out_buffer, format="mp3", bitrate="192k")
-                
-                bar.empty()
+                status_box.success("Audio creating... 100% done. **Created!**")
                 duration = round(time.time() - start_time, 1)
-                st.success(f"🎉 Dialogue generated in **{duration} seconds**!")
-                st.audio(out_buffer.getvalue(), format="audio/mp3")
-                st.download_button("⬇️ Download Dialogue MP3", out_buffer.getvalue(), "WordWave_Dialogue.mp3", "audio/mp3", use_container_width=True)
+                st.caption(f"⏱️ Generated in {duration} seconds")
+                st.audio(combined_audio, format="audio/mp3")
+                st.download_button("⬇️ Download Dialogue MP3", combined_audio, "WordWave_Dialogue.mp3", "audio/mp3", use_container_width=True)
             except Exception as e:
+                status_box.empty()
                 st.error(f"Error mixing dialogue: {e}")
 
 # ==========================================
@@ -315,14 +312,15 @@ with tab3:
         if not studio_text.strip():
             st.warning("Please enter text.")
         else:
+            status_box = st.empty() # Placeholder under button
             start_time = time.time()
             
             if clean_pdf:
                 studio_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', studio_text)
             
             chunks = [p for p in studio_text.split('\n') if p.strip()]
+            total_chunks = len(chunks)
             
-            bar = st.progress(0, text="Initializing...")
             audio_chunks = []
             submaker = edge_tts.SubMaker() if generate_srt else None
 
@@ -330,26 +328,18 @@ with tab3:
                 default_voice = "en-US-ChristopherNeural"
                 
                 for i, chunk in enumerate(chunks):
-                    bar.progress(int((i/len(chunks))*100), text=f"Synthesizing chunk {i+1}/{len(chunks)}...")
+                    percent = int(((i + 1) / total_chunks) * 100)
+                    status_box.info(f"Audio creating... **{percent}%** done")
+                    
                     chunk_bytes = asyncio.run(generate_audio_async(chunk, default_voice, submaker=submaker))
                     audio_chunks.append(chunk_bytes)
 
-                bar.progress(85, text="Merging Audio...")
+                combined_audio = b"".join(audio_chunks)
                 
-                # OPTIMIZATION: If no music is uploaded, just join the raw MP3s instantly!
                 if not music_file:
-                    combined_audio = b"".join(audio_chunks)
-                    
-                    # Quick pass through pydub to ensure clean playback without huge delays
-                    final_segment = AudioSegment.from_file(io.BytesIO(combined_audio), format="mp3")
-                    out_buffer = io.BytesIO()
-                    final_segment.export(out_buffer, format="mp3", bitrate="192k")
-                    final_bytes = out_buffer.getvalue()
-                
-                # If music IS uploaded, we mix it at the end in one single operation
+                    final_bytes = combined_audio
                 else:
-                    bar.progress(90, text="Mixing Background Music...")
-                    combined_audio = b"".join(audio_chunks)
+                    status_box.info("Audio creating... **99%** done (Mixing Music)")
                     final_segment = AudioSegment.from_file(io.BytesIO(combined_audio), format="mp3")
                     
                     music = AudioSegment.from_file(music_file, format="mp3")
@@ -366,9 +356,9 @@ with tab3:
                     final_segment.export(out_buffer, format="mp3", bitrate="192k")
                     final_bytes = out_buffer.getvalue()
 
-                bar.empty()
+                status_box.success("Audio creating... 100% done. **Created!**")
                 duration = round(time.time() - start_time, 1)
-                st.success(f"🎉 Audiobook Complete! (Took {duration}s)")
+                st.caption(f"⏱️ Generated in {duration} seconds")
                 
                 st.audio(final_bytes, format="audio/mp3")
                 st.download_button("⬇️ Download Full Audiobook (MP3)", final_bytes, "WordWave_Audiobook.mp3", "audio/mp3", use_container_width=True)
@@ -379,4 +369,5 @@ with tab3:
                         st.download_button("⬇️ Download Subtitles (SRT)", srt_data, "Subtitles.srt", "text/plain", use_container_width=True)
                         
             except Exception as e:
+                status_box.empty()
                 st.error(f"Production Error: {e}")
