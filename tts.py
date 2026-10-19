@@ -11,7 +11,7 @@ from pathlib import Path
 # PAGE CONFIGURATION
 # ---------------------------------------------------
 st.set_page_config(
-    page_title="Keep Laughing Voice Generator",
+    page_title="WordWave",
     page_icon="🎙️",
     layout="wide"
 )
@@ -28,7 +28,7 @@ if not st.session_state["app_unlocked"]:
         "### **This app has been temporarily shut down by the owner.**\n\n"
         "Free promotional access has expired and the hosting limits "
         "have been consumed.\n\n"
-        "To request access restoration, please contact **Hussaa1nn** directly."
+        "To request access restoration, please contact **Muneeb** directly."
     )
 
     # Hidden developer override
@@ -59,7 +59,7 @@ with col1:
         st.write("🎙️")
 
 with col2:
-    st.title("Keep Laughing with Hussaa1nn")
+    st.title("WordWave")
     st.caption("Text-to-speech and audiobook generator (Developer Mode Active)")
 
 # ---------------------------------------------------
