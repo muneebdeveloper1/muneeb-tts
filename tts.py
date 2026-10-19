@@ -68,10 +68,12 @@ def load_voices():
 with st.spinner("Initializing Voice Engine..."):
     voices = load_voices()
 
+# ✅ FIXED: Added "ur-IN" and other common locales
 LANGUAGE_MAP = {
     "en-US": "English (United States)", "en-GB": "English (United Kingdom)",
     "en-AU": "English (Australia)", "en-CA": "English (Canada)", "en-IN": "English (India)",
-    "ur-PK": "Urdu (Pakistan)", "hi-IN": "Hindi (India)", "ar-SA": "Arabic (Saudi Arabia)",
+    "ur-PK": "Urdu (Pakistan)", "ur-IN": "Urdu (India)",  # <-- Added ur-IN
+    "hi-IN": "Hindi (India)", "ar-SA": "Arabic (Saudi Arabia)",
     "tr-TR": "Turkish (Turkey)", "fr-FR": "French (France)", "de-DE": "German (Germany)",
     "es-ES": "Spanish (Spain)", "it-IT": "Italian (Italy)", "pt-BR": "Portuguese (Brazil)",
     "ru-RU": "Russian (Russia)", "ja-JP": "Japanese (Japan)", "ko-KR": "Korean (South Korea)",
@@ -82,11 +84,15 @@ LANGUAGE_MAP = {
     "vi-VN": "Vietnamese (Vietnam)"
 }
 
-# Group Locales under Base Languages (e.g., "English" -> ["en-US", "en-GB", ...])
+# ✅ ROBUST GROUPING: Guarantees a base name even if locale is missing from map
 base_lang_map = {}
 for loc in set([v["Locale"] for v in voices]):
     display_name = LANGUAGE_MAP.get(loc, loc)
-    base_name = display_name.split(" (")[0]
+    # Extract the base language (e.g., "Urdu" from "Urdu (Pakistan)")
+    if " (" in display_name:
+        base_name = display_name.split(" (")[0]
+    else:
+        base_name = display_name  # Fallback if format is unexpected
     if base_name not in base_lang_map:
         base_lang_map[base_name] = []
     base_lang_map[base_name].append(loc)
@@ -161,10 +167,8 @@ with tab1:
             return
         try:
             code = detect(text[:1000])
-            # Find which base language matches this code
             match_found = None
             for base_l in base_languages:
-                # Check if any locale in this base language starts with the detected code
                 if any(loc.startswith(code) for loc in base_lang_map[base_l]):
                     match_found = base_l
                     break
@@ -195,7 +199,6 @@ with tab1:
         elif msg_t == "warning": st.warning(msg_txt)
         else: st.error(msg_txt)
 
-    # Filter voices by selected base language
     valid_locales = base_lang_map[selected_base_lang]
     filtered = [v for v in voices if v["Locale"] in valid_locales]
 
@@ -209,7 +212,7 @@ with tab1:
     if st.session_state.gender_filter_t1 != "All":
         filtered = [v for v in filtered if v["Gender"] == st.session_state.gender_filter_t1]
 
-    # Format: "Guy (Male, US)"
+    # Format: "Gul (Female, IN)" - Includes the country code for clarity
     voice_names = [f"{v['ShortName'].split('-')[-1].replace('Neural','')} ({v['Gender']}, {v['Locale'].split('-')[-1]})" for v in filtered]
     voice_choice_t1 = st.selectbox("🎤 Select Voice", voice_names)
     selected_voice_t1 = filtered[voice_names.index(voice_choice_t1)]["ShortName"]
@@ -269,11 +272,9 @@ with tab2:
         
         c_lang_val = c_lang.selectbox("Main Language", base_languages, key=f"c_lang_{i}")
         
-        # Get valid voices for this character's language
         c_valid_locales = base_lang_map[c_lang_val]
         c_filtered_v = [v for v in voices if v["Locale"] in c_valid_locales]
         
-        # Format: "Guy (Male, US)"
         c_v_names = [f"{v['ShortName'].split('-')[-1].replace('Neural','')} ({v['Gender']}, {v['Locale'].split('-')[-1]})" for v in c_filtered_v]
         c_voice_val = c_voice.selectbox("Voice", c_v_names, key=f"c_voice_{i}")
         
@@ -328,7 +329,6 @@ with tab3:
     studio_text = st.text_area("Paste long text here:", height=250, key="tab3_text")
     
     with st.expander("🛠️ Studio Settings", expanded=True):
-        # NEW: Voice Selection for Audiobook
         audiobook_lang = st.selectbox("Main Language", base_languages, index=base_languages.index("English"), key="ab_lang")
         ab_valid_locales = base_lang_map[audiobook_lang]
         ab_filtered_v = [v for v in voices if v["Locale"] in ab_valid_locales]
