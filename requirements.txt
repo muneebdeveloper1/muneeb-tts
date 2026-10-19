@@ -7,3 +7,4 @@ pandas
 openpyxl
 langdetect
 pydub
+audioop-lts; python_version >= "3.13"
