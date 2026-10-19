@@ -6,3 +6,4 @@ python-docx
 pandas
 openpyxl
 langdetect
+pydub
