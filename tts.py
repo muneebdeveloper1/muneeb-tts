@@ -17,7 +17,7 @@ from langdetect import detect, LangDetectException
 # ---------------------------------------------------
 st.set_page_config(
     page_title="WordWave Studio",
-    page_icon="🎙️",
+    page_icon="logo.png",
     layout="wide"
 )
 
