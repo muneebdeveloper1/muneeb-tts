@@ -24,7 +24,7 @@ st.set_page_config(
 # ---------------------------------------------------
 # 🔑 OWNER UNLOCK GATEWAY
 # ---------------------------------------------------
-if "app_unlocked" not in st.session_state:
+"""if "app_unlocked" not in st.session_state:
     st.session_state["app_unlocked"] = False
 
 if not st.session_state["app_unlocked"]:
@@ -43,7 +43,7 @@ if not st.session_state["app_unlocked"]:
         else:
             st.error("❌ Incorrect Admin Passkey.")
     st.stop()
-
+"""
 # ---------------------------------------------------
 # HEADER
 # ---------------------------------------------------
