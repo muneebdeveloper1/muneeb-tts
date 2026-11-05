@@ -1,0 +1,10 @@
+streamlit
+edge-tts==7.3.1
+pillow
+pdfplumber
+python-docx
+pandas
+openpyxl
+langdetect
+pydub
+audioop-lts; python_version >= "3.13"
