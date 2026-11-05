@@ -125,21 +125,27 @@ def split_text_safely(text, max_chars=MAX_CHARS_PER_REQUEST):
 # ===========================================================
 # EDGE TTS ENGINE (CHUNKING AND RETRIES RUN SILENTLY IN BACKGROUND)
 # ===========================================================
-async def synthesize_one_chunk(text, voice, rate="+0%", pitch="+0Hz", word_timings=None):
-    """One Edge TTS request; optionally retain Edge TTS word-boundary metadata."""
+async def synthesize_one_chunk(
+    text, voice, rate="+0%", pitch="+0Hz", word_timings=None,
+    word_progress_callback=None
+):
+    """One Edge TTS request; optionally retain word timings and report real word progress."""
     communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     audio_buffer = bytearray()
 
     async for message in communicate.stream():
         if message.get("type") == "audio":
             audio_buffer.extend(message.get("data", b""))
-        elif message.get("type") == "WordBoundary" and word_timings is not None:
+        elif message.get("type") == "WordBoundary":
             # Edge TTS timestamps are in 100-nanosecond ticks.
-            word_timings.append({
-                "text": message.get("text", ""),
-                "offset_ms": int(message.get("offset", 0) / 10000),
-                "duration_ms": int(message.get("duration", 0) / 10000),
-            })
+            if word_timings is not None:
+                word_timings.append({
+                    "text": message.get("text", ""),
+                    "offset_ms": int(message.get("offset", 0) / 10000),
+                    "duration_ms": int(message.get("duration", 0) / 10000),
+                })
+            if word_progress_callback is not None:
+                word_progress_callback(message.get("text", ""))
 
     if not audio_buffer:
         raise RuntimeError("No audio data was received from Edge TTS for this text chunk.")
@@ -149,7 +155,8 @@ async def synthesize_one_chunk(text, voice, rate="+0%", pitch="+0Hz", word_timin
 
 
 async def synthesize_with_retry(
-    text, voice, rate="+0%", pitch="+0Hz", chunk_label="chunk", word_timings=None
+    text, voice, rate="+0%", pitch="+0Hz", chunk_label="chunk", word_timings=None,
+    word_progress_callback=None
 ):
     """Retry an individual text chunk and report the exact failed chunk."""
     last_error = None
@@ -157,7 +164,7 @@ async def synthesize_with_retry(
         attempt_timings = [] if word_timings is not None else None
         try:
             audio_result = await synthesize_one_chunk(
-                text, voice, rate, pitch, attempt_timings
+                text, voice, rate, pitch, attempt_timings, word_progress_callback
             )
             if word_timings is not None and attempt_timings:
                 word_timings.extend(attempt_timings)
@@ -185,17 +192,26 @@ async def generate_audio_chunks_async(
 
     combined = AudioSegment.empty()
     total = len(text_chunks)
+    total_words = max(1, len(re.findall(r"\S+", text)))
+    completed_words = 0
+    last_percent = 0
+
+    def on_word_boundary(_word):
+        nonlocal completed_words, last_percent
+        completed_words += 1
+        percent = min(99, int(completed_words * 100 / total_words))
+        if progress_callback and percent > last_percent:
+            last_percent = percent
+            progress_callback(percent)
 
     for index, text_chunk in enumerate(text_chunks, start=1):
-        if progress_callback:
-            progress_callback(index, total, text_chunk)
-
         chunk_bytes = await synthesize_with_retry(
             text_chunk,
             voice,
             rate,
             pitch,
-            chunk_label=f"Text chunk {index}/{total}"
+            chunk_label=f"Text chunk {index}/{total}",
+            word_progress_callback=on_word_boundary
         )
         segment = AudioSegment.from_file(io.BytesIO(chunk_bytes), format="mp3")
         combined += segment
@@ -394,8 +410,7 @@ with tab1:
                     progress = st.progress(0)
                     start_time = time.time()
                     try:
-                        def update_quick_progress(index, total, chunk):
-                            percent = max(1, min(99, int(index / total * 100)))
+                        def update_quick_progress(percent):
                             progress.progress(percent, text=f"{percent}%")
 
                         audio_bytes, chunk_count = asyncio.run(
@@ -478,6 +493,9 @@ with tab2:
                 async def build_dialogue():
                     final_audio = AudioSegment.empty()
                     total_lines = len(lines)
+                    total_words = max(1, len(re.findall(r"\S+", dialogue_text)))
+                    words_before_line = 0
+                    last_dialogue_percent = 0
                     for line_index, line in enumerate(lines, start=1):
                         match = re.match(r"^\[(.*?)\]:\s*(.*)$", line)
                         if match:
@@ -491,9 +509,21 @@ with tab2:
                         if not spoken_text:
                             continue
 
+                        line_word_count = max(1, len(re.findall(r"\S+", spoken_text)))
+
+                        def on_dialogue_percent(line_percent):
+                            nonlocal last_dialogue_percent
+                            estimated_done = words_before_line + (line_word_count * line_percent / 100)
+                            overall_percent = min(99, int(estimated_done * 100 / total_words))
+                            if overall_percent > last_dialogue_percent:
+                                last_dialogue_percent = overall_percent
+                                progress.progress(overall_percent, text=f"{overall_percent}%")
+
                         line_audio_bytes, _ = await generate_audio_chunks_async(
-                            spoken_text, voice, pause_seconds=0
+                            spoken_text, voice, progress_callback=on_dialogue_percent,
+                            pause_seconds=0
                         )
+                        words_before_line += line_word_count
                         line_segment = AudioSegment.from_file(
                             io.BytesIO(line_audio_bytes), format="mp3"
                         )
@@ -501,8 +531,6 @@ with tab2:
                         # A short pause makes speaker turns easier to distinguish.
                         if line_index < total_lines:
                             final_audio += AudioSegment.silent(duration=250)
-                        percent = max(1, min(100, int(line_index / total_lines * 100)))
-                        progress.progress(percent, text=f"{percent}%")
                     if len(final_audio) == 0:
                         raise RuntimeError("No spoken dialogue was generated. Check speaker labels and text.")
                     output = io.BytesIO()
@@ -573,13 +601,26 @@ with tab3:
                     total = len(text_chunks)
                     cumulative_audio_ms = 0
                     all_word_timings = []
+                    total_words = max(1, len(re.findall(r"\S+", source_text)))
+                    completed_words = 0
+                    last_percent = 0
+
+                    def on_audiobook_word(_word):
+                        nonlocal completed_words, last_percent
+                        completed_words += 1
+                        percent = min(99, int(completed_words * 100 / total_words))
+                        if percent > last_percent:
+                            last_percent = percent
+                            progress.progress(percent, text=f"{percent}%")
+
                     for chunk_index, text_chunk in enumerate(text_chunks, start=1):
                         chunk_word_timings = []
                         chunk_bytes = await synthesize_with_retry(
                             text_chunk,
                             audiobook_voice,
                             chunk_label=f"Audiobook chunk {chunk_index}/{total}",
-                            word_timings=chunk_word_timings
+                            word_timings=chunk_word_timings,
+                            word_progress_callback=on_audiobook_word
                         )
                         segment = AudioSegment.from_file(io.BytesIO(chunk_bytes), format="mp3")
 
@@ -594,8 +635,6 @@ with tab3:
 
                         combined += segment
                         cumulative_audio_ms += len(segment)
-                        percent = max(1, min(99, int(chunk_index / total * 99)))
-                        progress.progress(percent, text=f"{percent}%")
                         if chunk_index < total:
                             await asyncio.sleep(REQUEST_PAUSE_SECONDS)
 
