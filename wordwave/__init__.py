@@ -1,1 +1,0 @@
-"""WordWave Studio modular extensions."""
