@@ -1,52 +1,29 @@
 import streamlit as st
 import asyncio
 import edge_tts
-import aiohttp
 import pdfplumber
-import pandas as pd
 from docx import Document
 from pathlib import Path
 import time
 import io
 import re
+import random
+import traceback
 from pydub import AudioSegment
 from langdetect import detect, LangDetectException
 
-# ---------------------------------------------------
+# ===========================================================
 # PAGE CONFIGURATION
-# ---------------------------------------------------
+# ===========================================================
 st.set_page_config(
     page_title="WordWave Studio",
     page_icon="logo.png",
     layout="wide"
 )
 
-# ---------------------------------------------------
-# 🔑 OWNER UNLOCK GATEWAY
-# ---------------------------------------------------
-_DISABLED_GATEWAY = """if "app_unlocked" not in st.session_state:
-    st.session_state["app_unlocked"] = False
-
-if not st.session_state["app_unlocked"]:
-    st.error("🛑 Service Temporarily Suspended")
-    st.info(
-        "### **This application has been temporarily shut down by the owner.**\n\n"
-        "Free promotional access for this resource has expired and the hosting limits "
-        "have been consumed.\n\n"
-        "To request access restoration, please contact **Muneeb** directly."
-    )
-    secret_key = st.text_input("🔓 Developer Override Access:", type="password")
-    if st.button("Verify Admin Access"):
-        if secret_key == "Ilovemuh@mm@d": 
-            st.session_state["app_unlocked"] = True
-            st.rerun()
-        else:
-            st.error("❌ Incorrect Admin Passkey.")
-    st.stop()
-"""
-# ---------------------------------------------------
+# ===========================================================
 # HEADER
-# ---------------------------------------------------
+# ===========================================================
 col1, col2 = st.columns([1, 8])
 with col1:
     logo_path = Path("logo.png")
@@ -56,23 +33,20 @@ with col1:
         st.write("🎙️")
 with col2:
     st.title("WordWave Studio")
-    st.caption("Professional Audiobook & Text-to-Speech Pipeline (Developer Mode Active)")
+    st.caption("Professional Audiobook & Text-to-Speech Pipeline")
 
-# ---------------------------------------------------
-# DATA & API SETUP
-# ---------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_voices():
-    return asyncio.run(edge_tts.list_voices())
+# ===========================================================
+# CONFIGURATION
+# ===========================================================
+MAX_CHARS_PER_REQUEST = 1200
+MAX_RETRIES = 3
+RETRY_BASE_SECONDS = 2
+REQUEST_PAUSE_SECONDS = 0.25
 
-with st.spinner("Initializing Voice Engine..."):
-    voices = load_voices()
-
-# ✅ FIXED: Added "ur-IN" and other common locales
 LANGUAGE_MAP = {
     "en-US": "English (United States)", "en-GB": "English (United Kingdom)",
     "en-AU": "English (Australia)", "en-CA": "English (Canada)", "en-IN": "English (India)",
-    "ur-PK": "Urdu (Pakistan)", "ur-IN": "Urdu (India)",  # <-- Added ur-IN
+    "ur-PK": "Urdu (Pakistan)", "ur-IN": "Urdu (India)",
     "hi-IN": "Hindi (India)", "ar-SA": "Arabic (Saudi Arabia)",
     "tr-TR": "Turkish (Turkey)", "fr-FR": "French (France)", "de-DE": "German (Germany)",
     "es-ES": "Spanish (Spain)", "it-IT": "Italian (Italy)", "pt-BR": "Portuguese (Brazil)",
@@ -84,71 +58,286 @@ LANGUAGE_MAP = {
     "vi-VN": "Vietnamese (Vietnam)"
 }
 
-# ✅ ROBUST GROUPING: Guarantees a base name even if locale is missing from map
-base_lang_map = {}
-for loc in set([v["Locale"] for v in voices]):
-    display_name = LANGUAGE_MAP.get(loc, loc)
-    # Extract the base language (e.g., "Urdu" from "Urdu (Pakistan)")
-    if " (" in display_name:
-        base_name = display_name.split(" (")[0]
-    else:
-        base_name = display_name  # Fallback if format is unexpected
-    if base_name not in base_lang_map:
-        base_lang_map[base_name] = []
-    base_lang_map[base_name].append(loc)
-
-base_languages = sorted(list(base_lang_map.keys()))
-
+# ===========================================================
+# TEXT EXTRACTION
+# ===========================================================
 def extract_text(uploaded_file):
     extension = uploaded_file.name.rsplit(".", 1)[-1].lower()
     if extension == "txt":
-        return uploaded_file.getvalue().decode("utf-8-sig")
+        return uploaded_file.getvalue().decode("utf-8-sig", errors="replace")
     if extension == "pdf":
         pages = []
         with pdfplumber.open(uploaded_file) as pdf:
-            for page in pdf.pages:
+            for page_number, page in enumerate(pdf.pages, start=1):
                 page_text = page.extract_text()
-                if page_text: pages.append(page_text)
+                if page_text:
+                    pages.append(page_text)
         return "\n\n".join(pages)
     if extension == "docx":
         document = Document(uploaded_file)
         return "\n".join(paragraph.text for paragraph in document.paragraphs)
     return ""
 
-async def generate_audio_async(text, voice, rate="+0%", pitch="+0Hz", submaker=None):
+
+def split_text_safely(text, max_chars=MAX_CHARS_PER_REQUEST):
+    """Split text into manageable chunks, preferring paragraph/sentence/word boundaries."""
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    # Keep paragraph boundaries where possible, but do not let one paragraph become huge.
+    units = re.split(r"\n+|(?<=[.!?。！？؟])\s+", text)
+    chunks = []
+    current = ""
+
+    for unit in units:
+        unit = unit.strip()
+        if not unit:
+            continue
+
+        # Split a single oversized sentence at word boundaries.
+        while len(unit) > max_chars:
+            cut = unit.rfind(" ", 0, max_chars + 1)
+            if cut < 1:
+                cut = max_chars
+            piece = unit[:cut].strip()
+            if piece:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(piece)
+            unit = unit[cut:].strip()
+
+        if not unit:
+            continue
+
+        candidate = f"{current} {unit}".strip() if current else unit
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = unit
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# ===========================================================
+# EDGE TTS ENGINE WITH DIAGNOSTICS AND RETRIES
+# ===========================================================
+def classify_tts_error(error):
+    """Return a likely cause and practical next step for common failures."""
+    message = f"{type(error).__name__}: {error}"
+    lower = message.lower()
+
+    if any(term in lower for term in ["429", "too many requests", "throttl", "rate limit"]):
+        return (
+            "Rate limited by the TTS service",
+            "Wait several minutes, reduce request frequency, and try again."
+        )
+    if any(term in lower for term in ["403", "forbidden", "handshake", "websocket"]):
+        return (
+            "The Edge TTS WebSocket connection was rejected or could not be established",
+            "This is commonly temporary service/network blocking. Check internet access, update edge-tts, and retry later."
+        )
+    if any(term in lower for term in ["timeout", "timed out"]):
+        return (
+            "The TTS request timed out",
+            "Check connection stability and retry. Smaller chunks can reduce timeout risk."
+        )
+    if any(term in lower for term in ["no audio", "empty audio", "audio data"]):
+        return (
+            "The service returned no audio data",
+            "The service may have closed the request, rejected this text segment, or temporarily failed. Retry the failed segment."
+        )
+    if any(term in lower for term in ["voice", "invalid", "not found"]):
+        return (
+            "The selected voice may be unavailable or invalid",
+            "Refresh the voice list and select a voice that is currently listed."
+        )
+    if any(term in lower for term in ["connection", "network", "dns", "ssl"]):
+        return (
+            "A network or TLS connection problem occurred",
+            "Check internet access, firewall/proxy settings, and try again."
+        )
+    return (
+        "Unclassified Edge TTS error",
+        "Check the technical details below. If it persists, update edge-tts and test a short text sample."
+    )
+
+
+async def synthesize_one_chunk(text, voice, rate="+0%", pitch="+0Hz"):
+    """One Edge TTS request. Empty or malformed output is treated as failure."""
     communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     audio_buffer = bytearray()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            audio_buffer.extend(chunk["data"])
-        elif chunk["type"] == "WordBoundary" and submaker is not None:
-            submaker.feed(chunk)
-    return bytes(audio_buffer)
 
-# ---------------------------------------------------
+    async for message in communicate.stream():
+        if message.get("type") == "audio":
+            audio_buffer.extend(message.get("data", b""))
+
+    if not audio_buffer:
+        raise RuntimeError("No audio data was received from Edge TTS for this text chunk.")
+
+    audio_bytes = bytes(audio_buffer)
+    # Validate that returned bytes can actually be decoded as MP3.
+    try:
+        AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+    except Exception as decode_error:
+        raise RuntimeError(
+            f"Edge TTS returned data, but it was not a valid readable MP3: {decode_error}"
+        ) from decode_error
+
+    return audio_bytes
+
+
+async def synthesize_with_retry(text, voice, rate="+0%", pitch="+0Hz", chunk_label="chunk"):
+    """Retry an individual text chunk and report the exact failed chunk."""
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return await synthesize_one_chunk(text, voice, rate, pitch)
+        except Exception as error:
+            last_error = error
+            if attempt < MAX_RETRIES:
+                wait_seconds = RETRY_BASE_SECONDS ** attempt + random.uniform(0, 0.5)
+                await asyncio.sleep(wait_seconds)
+
+    cause, remedy = classify_tts_error(last_error)
+    preview = re.sub(r"\s+", " ", text)[:180]
+    raise RuntimeError(
+        f"{chunk_label} failed after {MAX_RETRIES} attempts.\n"
+        f"Likely cause: {cause}.\n"
+        f"Suggested action: {remedy}\n"
+        f"Technical error: {type(last_error).__name__}: {last_error}\n"
+        f"Text preview: {preview}"
+    ) from last_error
+
+
+async def generate_audio_chunks_async(
+    text, voice, rate="+0%", pitch="+0Hz", progress_callback=None,
+    max_chars=MAX_CHARS_PER_REQUEST, pause_seconds=REQUEST_PAUSE_SECONDS
+):
+    """External chunking, retries, MP3 decoding, and safe audio concatenation."""
+    text_chunks = split_text_safely(text, max_chars=max_chars)
+    if not text_chunks:
+        raise ValueError("There is no readable text to synthesize.")
+
+    combined = AudioSegment.empty()
+    total = len(text_chunks)
+
+    for index, text_chunk in enumerate(text_chunks, start=1):
+        if progress_callback:
+            progress_callback(index, total, text_chunk)
+
+        chunk_bytes = await synthesize_with_retry(
+            text_chunk,
+            voice,
+            rate,
+            pitch,
+            chunk_label=f"Text chunk {index}/{total}"
+        )
+        segment = AudioSegment.from_file(io.BytesIO(chunk_bytes), format="mp3")
+        combined += segment
+
+        if index < total and pause_seconds > 0:
+            await asyncio.sleep(pause_seconds)
+
+    if len(combined) == 0:
+        raise RuntimeError("All requests completed but the combined audio is empty.")
+
+    output = io.BytesIO()
+    combined.export(output, format="mp3", bitrate="192k")
+    result = output.getvalue()
+    if not result:
+        raise RuntimeError("MP3 export completed but produced an empty file.")
+    return result, total
+
+
+def show_generation_error(title, error):
+    st.error(title)
+    cause, remedy = classify_tts_error(error)
+    with st.expander("🔎 Error diagnosis and technical details", expanded=True):
+        st.markdown(f"**Likely issue:** {cause}")
+        st.markdown(f"**What to do:** {remedy}")
+        st.code(f"{type(error).__name__}: {error}")
+
+
+def voice_label(voice):
+    name = voice.get("ShortName", "Unknown")
+    locale = voice.get("Locale", "Unknown")
+    gender = voice.get("Gender", "Unknown")
+    display_name = name.split("-")[-1].replace("Neural", "")
+    country = locale.split("-")[-1] if "-" in locale else locale
+    return f"{display_name} ({gender}, {country})"
+
+
+# ===========================================================
+# LOAD VOICES
+# ===========================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_voices():
+    return asyncio.run(edge_tts.list_voices())
+
+try:
+    with st.spinner("Initializing Voice Engine..."):
+        voices = load_voices()
+    if not voices:
+        st.error("The voice service returned an empty voice list. Check your connection and try refreshing.")
+        st.stop()
+except Exception as error:
+    show_generation_error("Could not load Microsoft Edge TTS voices.", error)
+    st.stop()
+
+base_lang_map = {}
+for voice_item in voices:
+    locale = voice_item.get("Locale")
+    if not locale:
+        continue
+    display_name = LANGUAGE_MAP.get(locale, locale)
+    base_name = display_name.split(" (")[0] if " (" in display_name else display_name
+    base_lang_map.setdefault(base_name, []).append(locale)
+
+base_languages = sorted(base_lang_map)
+if not base_languages:
+    st.error("No supported voice languages were returned by the TTS service.")
+    st.stop()
+
+# ===========================================================
 # MAIN APP TABS
-# ---------------------------------------------------
+# ===========================================================
 tab1, tab2, tab3 = st.tabs(["🎙️ Quick Voice", "🎭 Multi-Voice Dialogue", "📚 Audiobook Studio"])
 
-# ==========================================
+# ===========================================================
 # TAB 1: QUICK VOICE
-# ==========================================
+# ===========================================================
 with tab1:
     st.markdown("### 📄 Text Input")
-    
-    uploaded_file = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"], key="tab1_upload")
-    if "edited_text_1" not in st.session_state: st.session_state.edited_text_1 = ""
-    
-    if uploaded_file:
-        st.session_state.edited_text_1 = extract_text(uploaded_file)
+    uploaded_file = st.file_uploader(
+        "Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"], key="tab1_upload"
+    )
+    if "edited_text_1" not in st.session_state:
+        st.session_state.edited_text_1 = ""
 
-    text_to_speak = st.text_area("Edit or type your text here:", value=st.session_state.edited_text_1, height=250, key="tab1_text")
+    if uploaded_file:
+        try:
+            st.session_state.edited_text_1 = extract_text(uploaded_file)
+        except Exception as error:
+            st.error(f"Could not read the uploaded file: {type(error).__name__}: {error}")
+
+    text_to_speak = st.text_area(
+        "Edit or type your text here:",
+        value=st.session_state.edited_text_1,
+        height=250,
+        key="tab1_text"
+    )
     st.session_state.edited_text_1 = text_to_speak
 
     words = len(text_to_speak.split())
-    sentences = len([s for s in text_to_speak.replace('!', '.').replace('?', '.').split('.') if s.strip()])
-    read_time = round(words / 150, 1) if words > 0 else 0
-    
+    sentences = len([s for s in re.split(r"[.!?؟]+", text_to_speak) if s.strip()])
+    read_time = round(words / 150, 1) if words else 0
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Characters", len(text_to_speak))
     c2.metric("Words", words)
@@ -156,37 +345,37 @@ with tab1:
     c4.metric("Est. Read Time", f"{read_time} min")
 
     st.divider()
-
-    if "selected_base_lang_t1" not in st.session_state: st.session_state.selected_base_lang_t1 = "English"
-    if "detect_msg_t1" not in st.session_state: st.session_state.detect_msg_t1 = None
+    if "selected_base_lang_t1" not in st.session_state or st.session_state.selected_base_lang_t1 not in base_languages:
+        st.session_state.selected_base_lang_t1 = "English" if "English" in base_languages else base_languages[0]
+    if "detect_msg_t1" not in st.session_state:
+        st.session_state.detect_msg_t1 = None
 
     def detect_lang_t1():
-        text = st.session_state.tab1_text
-        if not text.strip():
+        source_text = st.session_state.get("tab1_text", "")
+        if not source_text.strip():
             st.session_state.detect_msg_t1 = "warning|Please enter text first."
             return
         try:
-            code = detect(text[:1000])
-            match_found = None
-            for base_l in base_languages:
-                if any(loc.startswith(code) for loc in base_lang_map[base_l]):
-                    match_found = base_l
-                    break
-            
-            if match_found:
-                st.session_state.selected_base_lang_t1 = match_found
-                st.session_state.detect_msg_t1 = f"success|Detected Language: **{match_found}**"
+            detected_code = detect(source_text[:1500])
+            match = next(
+                (base for base, locales in base_lang_map.items()
+                 if any(locale.split("-")[0] == detected_code for locale in locales)),
+                None
+            )
+            if match:
+                st.session_state.selected_base_lang_t1 = match
+                st.session_state.detect_msg_t1 = f"success|Detected language: {match}"
             else:
-                st.session_state.detect_msg_t1 = f"warning|Detected '{code}', but no voices found."
-        except:
-            st.session_state.detect_msg_t1 = "error|Could not detect language."
+                st.session_state.detect_msg_t1 = f"warning|Detected '{detected_code}', but no matching voice is available."
+        except LangDetectException:
+            st.session_state.detect_msg_t1 = "error|Language detection failed. Enter a longer text sample."
+        except Exception as error:
+            st.session_state.detect_msg_t1 = f"error|{type(error).__name__}: {error}"
 
     col_lang, col_btn = st.columns([3, 1])
     with col_lang:
         selected_base_lang = st.selectbox(
-            "🌍 Main Language", 
-            base_languages, 
-            key="selected_base_lang_t1"
+            "🌍 Main Language", base_languages, key="selected_base_lang_t1"
         )
     with col_btn:
         st.write("")
@@ -194,213 +383,319 @@ with tab1:
         st.button("🔍 Auto-Detect", use_container_width=True, on_click=detect_lang_t1)
 
     if st.session_state.detect_msg_t1:
-        msg_t, msg_txt = st.session_state.detect_msg_t1.split("|", 1)
-        if msg_t == "success": st.success(msg_txt)
-        elif msg_t == "warning": st.warning(msg_txt)
-        else: st.error(msg_txt)
+        msg_type, msg_text = st.session_state.detect_msg_t1.split("|", 1)
+        if msg_type == "success":
+            st.success(msg_text)
+        elif msg_type == "warning":
+            st.warning(msg_text)
+        else:
+            st.error(msg_text)
 
     valid_locales = base_lang_map[selected_base_lang]
-    filtered = [v for v in voices if v["Locale"] in valid_locales]
+    filtered_voices = [v for v in voices if v.get("Locale") in valid_locales]
+    if not filtered_voices:
+        st.warning("No voices are available for this language right now.")
+    else:
+        if "gender_filter_t1" not in st.session_state:
+            st.session_state.gender_filter_t1 = "All"
 
-    if "gender_filter_t1" not in st.session_state: st.session_state.gender_filter_t1 = "All"
-    
-    g1, g2, g3 = st.columns(3)
-    if g1.button("All Voices", use_container_width=True, key="btn_g1"): st.session_state.gender_filter_t1 = "All"
-    if g2.button("Male Voices", use_container_width=True, key="btn_g2"): st.session_state.gender_filter_t1 = "Male"
-    if g3.button("Female Voices", use_container_width=True, key="btn_g3"): st.session_state.gender_filter_t1 = "Female"
+        g1, g2, g3 = st.columns(3)
+        if g1.button("All Voices", use_container_width=True, key="btn_g1"):
+            st.session_state.gender_filter_t1 = "All"
+        if g2.button("Male Voices", use_container_width=True, key="btn_g2"):
+            st.session_state.gender_filter_t1 = "Male"
+        if g3.button("Female Voices", use_container_width=True, key="btn_g3"):
+            st.session_state.gender_filter_t1 = "Female"
 
-    if st.session_state.gender_filter_t1 != "All":
-        filtered = [v for v in filtered if v["Gender"] == st.session_state.gender_filter_t1]
-
-    # Format: "Gul (Female, IN)" - Includes the country code for clarity
-    voice_names = [f"{v['ShortName'].split('-')[-1].replace('Neural','')} ({v['Gender']}, {v['Locale'].split('-')[-1]})" for v in filtered]
-    voice_choice_t1 = st.selectbox("🎤 Select Voice", voice_names)
-    selected_voice_t1 = filtered[voice_names.index(voice_choice_t1)]["ShortName"]
-
-    with st.expander("⚙️ Voice Settings"):
-        c_speed, c_pitch = st.columns(2)
-        speed_t1 = c_speed.slider("⚡ Speed", -50, 50, 0)
-        pitch_t1 = c_pitch.slider("🎵 Pitch", -50, 50, 0)
-
-    st.write("")
-    if st.button("🎙️ Generate Full Audio File", use_container_width=True, type="primary"):
-        if not text_to_speak.strip():
-            st.warning("Please provide text before generating.")
+        visible_voices = filtered_voices
+        if st.session_state.gender_filter_t1 != "All":
+            visible_voices = [v for v in filtered_voices if v.get("Gender") == st.session_state.gender_filter_t1]
+        if not visible_voices:
+            st.warning("No voices match this gender filter. Select All Voices.")
         else:
-            status_box = st.empty()
-            start_time = time.time()
-            try:
-                status_box.info("Audio creating... 20% done")
-                status_box.info("Audio creating... 50% done")
-                audio_bytes = asyncio.run(generate_audio_async(text_to_speak, selected_voice_t1, f"{speed_t1:+d}%", f"{pitch_t1:+d}Hz"))
-                
-                status_box.success("Audio creating... 100% done. **Created!**")
-                
-                duration = round(time.time() - start_time, 2)
-                st.caption(f"⏱️ Generated in {duration} seconds")
-                st.audio(audio_bytes, format="audio/mp3")
-                st.download_button("⬇️ Download MP3", audio_bytes, "WordWave_Quick.mp3", "audio/mp3", use_container_width=True)
-            except Exception as e:
-                status_box.empty()
-                st.error(f"Generation Failed: {e}")
+            voice_names = [voice_label(v) for v in visible_voices]
+            voice_choice = st.selectbox("🎤 Select Voice", voice_names, key="quick_voice_choice")
+            selected_voice_t1 = visible_voices[voice_names.index(voice_choice)]["ShortName"]
 
-# ==========================================
+            with st.expander("⚙️ Voice Settings"):
+                c_speed, c_pitch = st.columns(2)
+                speed_t1 = c_speed.slider("⚡ Speed", -50, 50, 0, key="quick_speed")
+                pitch_t1 = c_pitch.slider("🎵 Pitch", -50, 50, 0, key="quick_pitch")
+
+            if st.button("🎙️ Generate Full Audio File", use_container_width=True, type="primary"):
+                if not text_to_speak.strip():
+                    st.warning("Please provide text before generating.")
+                else:
+                    status = st.empty()
+                    progress = st.progress(0)
+                    start_time = time.time()
+                    try:
+                        def update_quick_progress(index, total, chunk):
+                            progress.progress(int((index - 1) / total * 100))
+                            status.info(f"Synthesizing chunk {index}/{total} — automatic retry is enabled.")
+
+                        audio_bytes, chunk_count = asyncio.run(
+                            generate_audio_chunks_async(
+                                text_to_speak,
+                                selected_voice_t1,
+                                f"{speed_t1:+d}%",
+                                f"{pitch_t1:+d}Hz",
+                                progress_callback=update_quick_progress
+                            )
+                        )
+                        progress.progress(100)
+                        status.success(f"Audio created successfully. {chunk_count} text chunks merged into one MP3.")
+                        st.caption(f"⏱️ Generated in {time.time() - start_time:.1f} seconds")
+                        st.audio(audio_bytes, format="audio/mp3")
+                        st.download_button(
+                            "⬇️ Download MP3", audio_bytes,
+                            "WordWave_Quick.mp3", "audio/mpeg", use_container_width=True
+                        )
+                    except Exception as error:
+                        progress.empty()
+                        status.empty()
+                        show_generation_error("Quick Voice generation failed.", error)
+
+# ===========================================================
 # TAB 2: MULTI-VOICE DIALOGUE
-# ==========================================
+# ===========================================================
 with tab2:
     st.markdown("### 🎭 Multi-Voice Dialogue Generator")
-    st.info("Format your script with names in brackets: `[Alex]: Hello there!` `[Sarah]: Hi Alex!`")
-    
-    dialogue_text = st.text_area("Script:", height=200, placeholder="[Alex]: Hello there!\n[Sarah]: Hi Alex, how are you?", key="tab2_script")
-    
+    st.info("Format your script with names in brackets: `[Alex]: Hello there!` and `[Sarah]: Hi Alex!`")
+    dialogue_text = st.text_area(
+        "Script:", height=200,
+        placeholder="[Alex]: Hello there!\n[Sarah]: Hi Alex, how are you?",
+        key="tab2_script"
+    )
+
     st.divider()
     st.markdown("#### 👥 Character Setup")
-    
-    if "num_chars" not in st.session_state: st.session_state.num_chars = 2
+    if "num_chars" not in st.session_state:
+        st.session_state.num_chars = 2
 
     col_add, col_rem, _ = st.columns([1, 1, 4])
-    if col_add.button("➕ Add Character"): st.session_state.num_chars += 1
-    if col_rem.button("➖ Remove Character") and st.session_state.num_chars > 1: st.session_state.num_chars -= 1
+    if col_add.button("➕ Add Character"):
+        st.session_state.num_chars += 1
+    if col_rem.button("➖ Remove Character") and st.session_state.num_chars > 1:
+        st.session_state.num_chars -= 1
 
     char_configs = {}
     for i in range(st.session_state.num_chars):
-        st.markdown(f"**Character {i+1}**")
+        st.markdown(f"**Character {i + 1}**")
         c_name, c_lang, c_voice = st.columns([2, 2, 4])
-        
-        default_name = "Alex" if i == 0 else ("Sarah" if i == 1 else f"Character {i+1}")
-        c_name_val = c_name.text_input("Name", value=default_name, key=f"c_name_{i}")
-        
-        c_lang_val = c_lang.selectbox("Main Language", base_languages, key=f"c_lang_{i}")
-        
-        c_valid_locales = base_lang_map[c_lang_val]
-        c_filtered_v = [v for v in voices if v["Locale"] in c_valid_locales]
-        
-        c_v_names = [f"{v['ShortName'].split('-')[-1].replace('Neural','')} ({v['Gender']}, {v['Locale'].split('-')[-1]})" for v in c_filtered_v]
-        c_voice_val = c_voice.selectbox("Voice", c_v_names, key=f"c_voice_{i}")
-        
-        char_configs[c_name_val.lower()] = c_filtered_v[c_v_names.index(c_voice_val)]["ShortName"]
+        default_name = "Alex" if i == 0 else ("Sarah" if i == 1 else f"Character {i + 1}")
+        char_name = c_name.text_input("Name", value=default_name, key=f"c_name_{i}").strip()
+        char_language = c_lang.selectbox("Main Language", base_languages, key=f"c_lang_{i}")
+        locales = base_lang_map[char_language]
+        available = [v for v in voices if v.get("Locale") in locales]
+        labels = [voice_label(v) for v in available]
+        if available:
+            selected_label = c_voice.selectbox("Voice", labels, key=f"c_voice_{i}")
+            if char_name:
+                char_configs[char_name.lower()] = available[labels.index(selected_label)]["ShortName"]
+        else:
+            c_voice.warning("No voices available for this language.")
 
-    st.write("")
     if st.button("🎬 Generate Dialogue Audio", use_container_width=True, type="primary"):
         if not dialogue_text.strip():
             st.warning("Please enter a script.")
+        elif not char_configs:
+            st.warning("Configure at least one character and voice.")
         else:
-            status_box = st.empty()
+            lines = [line.strip() for line in dialogue_text.splitlines() if line.strip()]
+            default_voice = next(iter(char_configs.values()))
+            dialogue_segments = []
+            status = st.empty()
+            progress = st.progress(0)
             start_time = time.time()
-            
-            lines = [line.strip() for line in dialogue_text.split('\n') if line.strip()]
-            audio_chunks = []
-            default_voice = list(char_configs.values())[0]
-
             try:
-                for idx, line in enumerate(lines):
-                    match = re.match(r"^\[(.*?)\]:\s*(.*)", line)
-                    if match:
-                        speaker = match.group(1).lower()
-                        text = match.group(2)
-                        voice = char_configs.get(speaker, default_voice)
-                    else:
-                        text = line
-                        voice = default_voice
+                async def build_dialogue():
+                    final_audio = AudioSegment.empty()
+                    total_lines = len(lines)
+                    for line_index, line in enumerate(lines, start=1):
+                        match = re.match(r"^\[(.*?)\]:\s*(.*)$", line)
+                        if match:
+                            speaker = match.group(1).strip().lower()
+                            spoken_text = match.group(2).strip()
+                            voice = char_configs.get(speaker, default_voice)
+                        else:
+                            spoken_text = line
+                            voice = default_voice
 
-                    percent = int(((idx + 1) / len(lines)) * 100)
-                    status_box.info(f"Audio creating... **{percent}%** done")
-                    
-                    chunk_bytes = asyncio.run(generate_audio_async(text, voice))
-                    audio_chunks.append(chunk_bytes)
+                        if not spoken_text:
+                            continue
 
-                combined_audio = b"".join(audio_chunks)
-                
-                status_box.success("Audio creating... 100% done. **Created!**")
-                duration = round(time.time() - start_time, 1)
-                st.caption(f"⏱️ Generated in {duration} seconds")
+                        status.info(f"Processing dialogue line {line_index}/{total_lines}...")
+                        line_audio_bytes, _ = await generate_audio_chunks_async(
+                            spoken_text, voice, pause_seconds=0
+                        )
+                        line_segment = AudioSegment.from_file(
+                            io.BytesIO(line_audio_bytes), format="mp3"
+                        )
+                        final_audio += line_segment
+                        # A short pause makes speaker turns easier to distinguish.
+                        if line_index < total_lines:
+                            final_audio += AudioSegment.silent(duration=250)
+                        progress.progress(int(line_index / total_lines * 100))
+                    if len(final_audio) == 0:
+                        raise RuntimeError("No spoken dialogue was generated. Check speaker labels and text.")
+                    output = io.BytesIO()
+                    final_audio.export(output, format="mp3", bitrate="192k")
+                    return output.getvalue()
+
+                combined_audio = asyncio.run(build_dialogue())
+                status.success("Dialogue generated and all speaker clips merged into one MP3.")
+                st.caption(f"⏱️ Generated in {time.time() - start_time:.1f} seconds")
                 st.audio(combined_audio, format="audio/mp3")
-                st.download_button("⬇️ Download Dialogue MP3", combined_audio, "WordWave_Dialogue.mp3", "audio/mp3", use_container_width=True)
-            except Exception as e:
-                status_box.empty()
-                st.error(f"Error mixing dialogue: {e}")
+                st.download_button(
+                    "⬇️ Download Dialogue MP3", combined_audio,
+                    "WordWave_Dialogue.mp3", "audio/mpeg", use_container_width=True
+                )
+            except Exception as error:
+                progress.empty()
+                status.empty()
+                show_generation_error("Dialogue generation failed.", error)
 
-# ==========================================
+# ===========================================================
 # TAB 3: AUDIOBOOK STUDIO
-# ==========================================
+# ===========================================================
 with tab3:
     st.markdown("### 📚 Audiobook & Subtitle Studio")
-    
     studio_text = st.text_area("Paste long text here:", height=250, key="tab3_text")
-    
+
     with st.expander("🛠️ Studio Settings", expanded=True):
-        audiobook_lang = st.selectbox("Main Language", base_languages, index=base_languages.index("English"), key="ab_lang")
-        ab_valid_locales = base_lang_map[audiobook_lang]
-        ab_filtered_v = [v for v in voices if v["Locale"] in ab_valid_locales]
-        ab_v_names = [f"{v['ShortName'].split('-')[-1].replace('Neural','')} ({v['Gender']}, {v['Locale'].split('-')[-1]})" for v in ab_filtered_v]
-        ab_voice_name = st.selectbox("Select Voice", ab_v_names, key="ab_voice")
-        audiobook_voice = ab_filtered_v[ab_v_names.index(ab_voice_name)]["ShortName"]
-        
+        default_lang_index = base_languages.index("English") if "English" in base_languages else 0
+        audiobook_lang = st.selectbox(
+            "Main Language", base_languages, index=default_lang_index, key="ab_lang"
+        )
+        ab_locales = base_lang_map[audiobook_lang]
+        audiobook_voices = [v for v in voices if v.get("Locale") in ab_locales]
+        ab_voice_labels = [voice_label(v) for v in audiobook_voices]
+        ab_voice_label = st.selectbox("Select Voice", ab_voice_labels, key="ab_voice") if ab_voice_labels else None
+        audiobook_voice = audiobook_voices[ab_voice_labels.index(ab_voice_label)]["ShortName"] if ab_voice_label else None
+
         st.divider()
-        generate_srt = st.checkbox("Generate SRT Subtitles", value=True)
-        music_file = st.file_uploader("Upload Background Music (Optional MP3)", type=["mp3"])
+        generate_srt = st.checkbox("Generate approximate chunk-level SRT subtitles", value=False)
+        music_file = st.file_uploader("Upload Background Music (Optional MP3)", type=["mp3"], key="ab_music")
         music_volume = st.slider("Music Volume Reduction (dB)", -30, -5, -15)
         clean_pdf = st.checkbox("Remove PDF line breaks (fixes weird pausing)", value=True)
 
-    st.write("")
+    st.caption("Long audiobook text is split into small requests, retried automatically, then merged into one MP3.")
+
     if st.button("🏭 Start Audiobook Production", use_container_width=True, type="primary"):
         if not studio_text.strip():
             st.warning("Please enter text.")
+        elif not audiobook_voice:
+            st.warning("No voice is available for the selected language.")
         else:
-            status_box = st.empty()
-            start_time = time.time()
-            
+            source_text = studio_text
             if clean_pdf:
-                studio_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', studio_text)
-            
-            chunks = [p for p in studio_text.split('\n') if p.strip()]
-            total_chunks = len(chunks)
-            
-            audio_chunks = []
-            submaker = edge_tts.SubMaker() if generate_srt else None
-
+                source_text = re.sub(r"(?<!\n)\n(?!\n)", " ", source_text)
+            status = st.empty()
+            progress = st.progress(0)
+            start_time = time.time()
             try:
-                for i, chunk in enumerate(chunks):
-                    percent = int(((i + 1) / total_chunks) * 100)
-                    status_box.info(f"Audio creating... **{percent}%** done")
-                    
-                    chunk_bytes = asyncio.run(generate_audio_async(chunk, audiobook_voice, submaker=submaker))
-                    audio_chunks.append(chunk_bytes)
+                text_chunks = split_text_safely(source_text)
+                if not text_chunks:
+                    raise ValueError("No readable text remained after text cleanup.")
 
-                combined_audio = b"".join(audio_chunks)
-                
-                if not music_file:
-                    final_bytes = combined_audio
-                else:
-                    status_box.info("Audio creating... **99%** done (Mixing Music)")
-                    final_segment = AudioSegment.from_file(io.BytesIO(combined_audio), format="mp3")
-                    
-                    music = AudioSegment.from_file(music_file, format="mp3")
-                    music = music - abs(music_volume)
-                    
-                    if len(music) < len(final_segment):
-                        loops = (len(final_segment) // len(music)) + 1
-                        music = music * loops
-                    
-                    music = music[:len(final_segment)]
-                    final_segment = final_segment.overlay(music)
-                    
-                    out_buffer = io.BytesIO()
-                    final_segment.export(out_buffer, format="mp3", bitrate="192k")
-                    final_bytes = out_buffer.getvalue()
+                async def build_audiobook():
+                    combined = AudioSegment.empty()
+                    total = len(text_chunks)
+                    for chunk_index, text_chunk in enumerate(text_chunks, start=1):
+                        status.info(f"Audiobook synthesis: chunk {chunk_index}/{total}. Retrying automatically if needed...")
+                        chunk_bytes = await synthesize_with_retry(
+                            text_chunk,
+                            audiobook_voice,
+                            chunk_label=f"Audiobook chunk {chunk_index}/{total}"
+                        )
+                        segment = AudioSegment.from_file(io.BytesIO(chunk_bytes), format="mp3")
+                        combined += segment
+                        progress.progress(int(chunk_index / total * 90))
+                        if chunk_index < total:
+                            await asyncio.sleep(REQUEST_PAUSE_SECONDS)
 
-                status_box.success("Audio creating... 100% done. **Created!**")
-                duration = round(time.time() - start_time, 1)
-                st.caption(f"⏱️ Generated in {duration} seconds")
-                
+                    if len(combined) == 0:
+                        raise RuntimeError("Audiobook synthesis returned an empty audio track.")
+
+                    if music_file is not None:
+                        status.info("Mixing background music...")
+                        music_file.seek(0)
+                        music = AudioSegment.from_file(music_file, format="mp3")
+                        if len(music) == 0:
+                            raise ValueError("The uploaded background music file is empty or unreadable.")
+                        music = music - abs(music_volume)
+                        if len(music) < len(combined):
+                            repeats = (len(combined) // len(music)) + 1
+                            music = music * repeats
+                        music = music[:len(combined)]
+                        combined = combined.overlay(music)
+
+                    output = io.BytesIO()
+                    combined.export(output, format="mp3", bitrate="192k")
+                    return output.getvalue(), total, len(combined)
+
+                final_bytes, total_chunks, duration_ms = asyncio.run(build_audiobook())
+                progress.progress(100)
+                status.success(f"Audiobook created. {total_chunks} chunks merged into one MP3.")
+                st.caption(
+                    f"⏱️ Generated in {time.time() - start_time:.1f} seconds | "
+                    f"Audio duration: {duration_ms / 60000:.1f} minutes"
+                )
                 st.audio(final_bytes, format="audio/mp3")
-                st.download_button("⬇️ Download Full Audiobook (MP3)", final_bytes, "WordWave_Audiobook.mp3", "audio/mp3", use_container_width=True)
-                
-                if generate_srt and submaker:
-                    srt_data = submaker.get_srt()
-                    if srt_data:
-                        st.download_button("⬇️ Download Subtitles (SRT)", srt_data, "Subtitles.srt", "text/plain", use_container_width=True)
-                        
-            except Exception as e:
-                status_box.empty()
-                st.error(f"Production Error: {e}")
+                st.download_button(
+                    "⬇️ Download Full Audiobook (MP3)", final_bytes,
+                    "WordWave_Audiobook.mp3", "audio/mpeg", use_container_width=True
+                )
+
+                if generate_srt:
+                    # These are chunk-level captions with estimated timing, not word-level timings.
+                    total_chars = sum(len(chunk) for chunk in text_chunks)
+                    elapsed_ms = 0
+                    srt_entries = []
+                    for number, chunk in enumerate(text_chunks, start=1):
+                        estimated_ms = max(1000, int(duration_ms * len(chunk) / max(total_chars, 1)))
+                        start_ms = elapsed_ms
+                        end_ms = min(duration_ms, elapsed_ms + estimated_ms)
+                        def stamp(ms):
+                            hours = ms // 3600000
+                            minutes = (ms % 3600000) // 60000
+                            seconds = (ms % 60000) // 1000
+                            millis = ms % 1000
+                            return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
+                        srt_entries.append(
+                            f"{number}\n{stamp(start_ms)} --> {stamp(end_ms)}\n{chunk}\n"
+                        )
+                        elapsed_ms = end_ms
+                    srt_data = "\n".join(srt_entries)
+                    st.download_button(
+                        "⬇️ Download Approximate SRT Subtitles",
+                        srt_data.encode("utf-8"),
+                        "WordWave_Subtitles.srt",
+                        "text/plain",
+                        use_container_width=True
+                    )
+                    st.caption("SRT timestamps are estimated per text chunk; they are not word-level synchronized captions.")
+
+            except Exception as error:
+                progress.empty()
+                status.empty()
+                show_generation_error("Audiobook production failed.", error)
+
+# ===========================================================
+# FOOTER / TROUBLESHOOTING
+# ===========================================================
+with st.expander("🧰 Troubleshooting: Edge TTS"):
+    st.markdown(
+        """
+        - **403 / WebSocket handshake:** Microsoft may be rejecting the connection, or a network/proxy is blocking it. Retry later and update `edge-tts`.
+        - **429 / rate limit:** Wait before retrying. Avoid running several large jobs at once.
+        - **Timeout / connection reset:** Check internet stability. The app retries each chunk automatically.
+        - **No audio received:** The service returned no audio for a chunk. The error panel identifies the failed chunk and shows a text preview.
+        - **Invalid MP3 / decode error:** The returned bytes could not be decoded. Check the installed FFmpeg and pydub environment.
+
+        Update packages with: `pip install --upgrade edge-tts streamlit pydub`
+
+        `pydub` requires FFmpeg to be installed and available on PATH for MP3 decoding/encoding.
+        """
+    )
