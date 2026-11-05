@@ -196,15 +196,23 @@ async def generate_audio_chunks_async(
     completed_words = 0
     last_percent = 0
 
-    def on_word_boundary(_word):
-        nonlocal completed_words, last_percent
-        completed_words += 1
-        percent = min(99, int(completed_words * 100 / total_words))
+    def publish_progress(done_words):
+        nonlocal last_percent
+        percent = min(99, int(done_words * 100 / total_words))
         if progress_callback and percent > last_percent:
             last_percent = percent
             progress_callback(percent)
 
     for index, text_chunk in enumerate(text_chunks, start=1):
+        chunk_words = max(0, len(re.findall(r"\S+", text_chunk)))
+        chunk_boundary_words = 0
+
+        def on_word_boundary(_word):
+            nonlocal chunk_boundary_words
+            chunk_boundary_words += 1
+            # Word events provide finer progress when the service emits them.
+            publish_progress(completed_words + min(chunk_boundary_words, chunk_words))
+
         chunk_bytes = await synthesize_with_retry(
             text_chunk,
             voice,
@@ -215,6 +223,10 @@ async def generate_audio_chunks_async(
         )
         segment = AudioSegment.from_file(io.BytesIO(chunk_bytes), format="mp3")
         combined += segment
+
+        # Reliable fallback: count the whole chunk only after its audio succeeds.
+        completed_words += chunk_words
+        publish_progress(completed_words)
 
         if index < total and pause_seconds > 0:
             await asyncio.sleep(pause_seconds)
@@ -605,16 +617,24 @@ with tab3:
                     completed_words = 0
                     last_percent = 0
 
-                    def on_audiobook_word(_word):
-                        nonlocal completed_words, last_percent
-                        completed_words += 1
-                        percent = min(99, int(completed_words * 100 / total_words))
+                    def publish_audiobook_progress(done_words):
+                        nonlocal last_percent
+                        percent = min(99, int(done_words * 100 / total_words))
                         if percent > last_percent:
                             last_percent = percent
                             progress.progress(percent, text=f"{percent}%")
 
                     for chunk_index, text_chunk in enumerate(text_chunks, start=1):
+                        chunk_word_count = max(0, len(re.findall(r"\S+", text_chunk)))
+                        chunk_boundary_words = 0
                         chunk_word_timings = []
+
+                        def on_audiobook_word(_word):
+                            nonlocal chunk_boundary_words
+                            chunk_boundary_words += 1
+                            publish_audiobook_progress(
+                                completed_words + min(chunk_boundary_words, chunk_word_count)
+                            )
                         chunk_bytes = await synthesize_with_retry(
                             text_chunk,
                             audiobook_voice,
@@ -635,6 +655,9 @@ with tab3:
 
                         combined += segment
                         cumulative_audio_ms += len(segment)
+                        # Fallback progress update after each successfully synthesized chunk.
+                        completed_words += chunk_word_count
+                        publish_audiobook_progress(completed_words)
                         if chunk_index < total:
                             await asyncio.sleep(REQUEST_PAUSE_SECONDS)
 
