@@ -7,8 +7,6 @@ from pathlib import Path
 import time
 import io
 import re
-import random
-import traceback
 from pydub import AudioSegment
 from langdetect import detect, LangDetectException
 
@@ -125,93 +123,54 @@ def split_text_safely(text, max_chars=MAX_CHARS_PER_REQUEST):
 
 
 # ===========================================================
-# EDGE TTS ENGINE WITH DIAGNOSTICS AND RETRIES
+# EDGE TTS ENGINE (CHUNKING AND RETRIES RUN SILENTLY IN BACKGROUND)
 # ===========================================================
-def classify_tts_error(error):
-    """Return a likely cause and practical next step for common failures."""
-    message = f"{type(error).__name__}: {error}"
-    lower = message.lower()
-
-    if any(term in lower for term in ["429", "too many requests", "throttl", "rate limit"]):
-        return (
-            "Rate limited by the TTS service",
-            "Wait several minutes, reduce request frequency, and try again."
-        )
-    if any(term in lower for term in ["403", "forbidden", "handshake", "websocket"]):
-        return (
-            "The Edge TTS WebSocket connection was rejected or could not be established",
-            "This is commonly temporary service/network blocking. Check internet access, update edge-tts, and retry later."
-        )
-    if any(term in lower for term in ["timeout", "timed out"]):
-        return (
-            "The TTS request timed out",
-            "Check connection stability and retry. Smaller chunks can reduce timeout risk."
-        )
-    if any(term in lower for term in ["no audio", "empty audio", "audio data"]):
-        return (
-            "The service returned no audio data",
-            "The service may have closed the request, rejected this text segment, or temporarily failed. Retry the failed segment."
-        )
-    if any(term in lower for term in ["voice", "invalid", "not found"]):
-        return (
-            "The selected voice may be unavailable or invalid",
-            "Refresh the voice list and select a voice that is currently listed."
-        )
-    if any(term in lower for term in ["connection", "network", "dns", "ssl"]):
-        return (
-            "A network or TLS connection problem occurred",
-            "Check internet access, firewall/proxy settings, and try again."
-        )
-    return (
-        "Unclassified Edge TTS error",
-        "Check the technical details below. If it persists, update edge-tts and test a short text sample."
-    )
-
-
-async def synthesize_one_chunk(text, voice, rate="+0%", pitch="+0Hz"):
-    """One Edge TTS request. Empty or malformed output is treated as failure."""
+async def synthesize_one_chunk(text, voice, rate="+0%", pitch="+0Hz", word_timings=None):
+    """One Edge TTS request; optionally retain Edge TTS word-boundary metadata."""
     communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     audio_buffer = bytearray()
 
     async for message in communicate.stream():
         if message.get("type") == "audio":
             audio_buffer.extend(message.get("data", b""))
+        elif message.get("type") == "WordBoundary" and word_timings is not None:
+            # Edge TTS timestamps are in 100-nanosecond ticks.
+            word_timings.append({
+                "text": message.get("text", ""),
+                "offset_ms": int(message.get("offset", 0) / 10000),
+                "duration_ms": int(message.get("duration", 0) / 10000),
+            })
 
     if not audio_buffer:
         raise RuntimeError("No audio data was received from Edge TTS for this text chunk.")
 
-    audio_bytes = bytes(audio_buffer)
-    # Validate that returned bytes can actually be decoded as MP3.
-    try:
-        AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
-    except Exception as decode_error:
-        raise RuntimeError(
-            f"Edge TTS returned data, but it was not a valid readable MP3: {decode_error}"
-        ) from decode_error
-
-    return audio_bytes
+    # MP3 decoding is performed once during audio merging to avoid duplicate work.
+    return bytes(audio_buffer)
 
 
-async def synthesize_with_retry(text, voice, rate="+0%", pitch="+0Hz", chunk_label="chunk"):
+async def synthesize_with_retry(
+    text, voice, rate="+0%", pitch="+0Hz", chunk_label="chunk", word_timings=None
+):
     """Retry an individual text chunk and report the exact failed chunk."""
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
+        attempt_timings = [] if word_timings is not None else None
         try:
-            return await synthesize_one_chunk(text, voice, rate, pitch)
+            audio_result = await synthesize_one_chunk(
+                text, voice, rate, pitch, attempt_timings
+            )
+            if word_timings is not None and attempt_timings:
+                word_timings.extend(attempt_timings)
+            return audio_result
         except Exception as error:
             last_error = error
             if attempt < MAX_RETRIES:
-                wait_seconds = RETRY_BASE_SECONDS ** attempt + random.uniform(0, 0.5)
+                wait_seconds = RETRY_BASE_SECONDS ** attempt
                 await asyncio.sleep(wait_seconds)
 
-    cause, remedy = classify_tts_error(last_error)
-    preview = re.sub(r"\s+", " ", text)[:180]
     raise RuntimeError(
-        f"{chunk_label} failed after {MAX_RETRIES} attempts.\n"
-        f"Likely cause: {cause}.\n"
-        f"Suggested action: {remedy}\n"
-        f"Technical error: {type(last_error).__name__}: {last_error}\n"
-        f"Text preview: {preview}"
+        f"Audio generation failed in {chunk_label} after {MAX_RETRIES} attempts. "
+        f"Original error: {type(last_error).__name__}: {last_error}"
     ) from last_error
 
 
@@ -256,12 +215,8 @@ async def generate_audio_chunks_async(
 
 
 def show_generation_error(title, error):
-    st.error(title)
-    cause, remedy = classify_tts_error(error)
-    with st.expander("🔎 Error diagnosis and technical details", expanded=True):
-        st.markdown(f"**Likely issue:** {cause}")
-        st.markdown(f"**What to do:** {remedy}")
-        st.code(f"{type(error).__name__}: {error}")
+    """Display the actual failure only when generation fails."""
+    st.error(f"{title}\n\n{type(error).__name__}: {error}")
 
 
 def voice_label(voice):
@@ -271,6 +226,25 @@ def voice_label(voice):
     display_name = name.split("-")[-1].replace("Neural", "")
     country = locale.split("-")[-1] if "-" in locale else locale
     return f"{display_name} ({gender}, {country})"
+
+
+def render_text_stats(text):
+    """Render live text statistics; Streamlit reruns after every text edit."""
+    text = text or ""
+    words = len(re.findall(r"\S+", text))
+    sentences = len([
+        part for part in re.split(r"[.!?؟。！？]+", text)
+        if part.strip()
+    ])
+    if text.strip() and sentences == 0:
+        sentences = 1
+    read_minutes = words / 150 if words else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Characters", f"{len(text):,}")
+    c2.metric("Words", f"{words:,}")
+    c3.metric("Sentences", f"{sentences:,}")
+    c4.metric("Est. Read Time", f"{read_minutes:.1f} min")
 
 
 # ===========================================================
@@ -317,32 +291,22 @@ with tab1:
     uploaded_file = st.file_uploader(
         "Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"], key="tab1_upload"
     )
-    if "edited_text_1" not in st.session_state:
-        st.session_state.edited_text_1 = ""
-
+    # Populate the editor once when a new file is uploaded.
     if uploaded_file:
         try:
-            st.session_state.edited_text_1 = extract_text(uploaded_file)
+            upload_signature = (uploaded_file.name, uploaded_file.size)
+            if st.session_state.get("tab1_upload_signature") != upload_signature:
+                st.session_state["tab1_text"] = extract_text(uploaded_file)
+                st.session_state["tab1_upload_signature"] = upload_signature
         except Exception as error:
             st.error(f"Could not read the uploaded file: {type(error).__name__}: {error}")
 
     text_to_speak = st.text_area(
         "Edit or type your text here:",
-        value=st.session_state.edited_text_1,
         height=250,
         key="tab1_text"
     )
-    st.session_state.edited_text_1 = text_to_speak
-
-    words = len(text_to_speak.split())
-    sentences = len([s for s in re.split(r"[.!?؟]+", text_to_speak) if s.strip()])
-    read_time = round(words / 150, 1) if words else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Characters", len(text_to_speak))
-    c2.metric("Words", words)
-    c3.metric("Sentences", sentences)
-    c4.metric("Est. Read Time", f"{read_time} min")
+    render_text_stats(text_to_speak)
 
     st.divider()
     if "selected_base_lang_t1" not in st.session_state or st.session_state.selected_base_lang_t1 not in base_languages:
@@ -431,8 +395,8 @@ with tab1:
                     start_time = time.time()
                     try:
                         def update_quick_progress(index, total, chunk):
-                            progress.progress(int((index - 1) / total * 100))
-                            status.info(f"Synthesizing chunk {index}/{total} — automatic retry is enabled.")
+                            percent = max(1, min(99, int(index / total * 100)))
+                            progress.progress(percent, text=f"{percent}%")
 
                         audio_bytes, chunk_count = asyncio.run(
                             generate_audio_chunks_async(
@@ -443,8 +407,8 @@ with tab1:
                                 progress_callback=update_quick_progress
                             )
                         )
-                        progress.progress(100)
-                        status.success(f"Audio created successfully. {chunk_count} text chunks merged into one MP3.")
+                        progress.progress(100, text="100%")
+                        status.success("Audio created successfully.")
                         st.caption(f"⏱️ Generated in {time.time() - start_time:.1f} seconds")
                         st.audio(audio_bytes, format="audio/mp3")
                         st.download_button(
@@ -467,6 +431,8 @@ with tab2:
         placeholder="[Alex]: Hello there!\n[Sarah]: Hi Alex, how are you?",
         key="tab2_script"
     )
+
+    render_text_stats(dialogue_text)
 
     st.divider()
     st.markdown("#### 👥 Character Setup")
@@ -525,7 +491,6 @@ with tab2:
                         if not spoken_text:
                             continue
 
-                        status.info(f"Processing dialogue line {line_index}/{total_lines}...")
                         line_audio_bytes, _ = await generate_audio_chunks_async(
                             spoken_text, voice, pause_seconds=0
                         )
@@ -536,7 +501,8 @@ with tab2:
                         # A short pause makes speaker turns easier to distinguish.
                         if line_index < total_lines:
                             final_audio += AudioSegment.silent(duration=250)
-                        progress.progress(int(line_index / total_lines * 100))
+                        percent = max(1, min(100, int(line_index / total_lines * 100)))
+                        progress.progress(percent, text=f"{percent}%")
                     if len(final_audio) == 0:
                         raise RuntimeError("No spoken dialogue was generated. Check speaker labels and text.")
                     output = io.BytesIO()
@@ -544,7 +510,8 @@ with tab2:
                     return output.getvalue()
 
                 combined_audio = asyncio.run(build_dialogue())
-                status.success("Dialogue generated and all speaker clips merged into one MP3.")
+                progress.progress(100, text="100%")
+                status.success("Dialogue audio created successfully.")
                 st.caption(f"⏱️ Generated in {time.time() - start_time:.1f} seconds")
                 st.audio(combined_audio, format="audio/mp3")
                 st.download_button(
@@ -562,6 +529,7 @@ with tab2:
 with tab3:
     st.markdown("### 📚 Audiobook & Subtitle Studio")
     studio_text = st.text_area("Paste long text here:", height=250, key="tab3_text")
+    render_text_stats(studio_text)
 
     with st.expander("🛠️ Studio Settings", expanded=True):
         default_lang_index = base_languages.index("English") if "English" in base_languages else 0
@@ -575,12 +543,10 @@ with tab3:
         audiobook_voice = audiobook_voices[ab_voice_labels.index(ab_voice_label)]["ShortName"] if ab_voice_label else None
 
         st.divider()
-        generate_srt = st.checkbox("Generate approximate chunk-level SRT subtitles", value=False)
         music_file = st.file_uploader("Upload Background Music (Optional MP3)", type=["mp3"], key="ab_music")
         music_volume = st.slider("Music Volume Reduction (dB)", -30, -5, -15)
         clean_pdf = st.checkbox("Remove PDF line breaks (fixes weird pausing)", value=True)
-
-    st.caption("Long audiobook text is split into small requests, retried automatically, then merged into one MP3.")
+        st.caption("Edge TTS word timings are retained temporarily in memory. No SRT is created unless you request it after audio generation.")
 
     if st.button("🏭 Start Audiobook Production", use_container_width=True, type="primary"):
         if not studio_text.strip():
@@ -588,6 +554,9 @@ with tab3:
         elif not audiobook_voice:
             st.warning("No voice is available for the selected language.")
         else:
+            # A new production replaces any previous temporary subtitle timings.
+            st.session_state["ab_audio_ready"] = False
+            st.session_state["ab_word_timings"] = []
             source_text = studio_text
             if clean_pdf:
                 source_text = re.sub(r"(?<!\n)\n(?!\n)", " ", source_text)
@@ -602,16 +571,31 @@ with tab3:
                 async def build_audiobook():
                     combined = AudioSegment.empty()
                     total = len(text_chunks)
+                    cumulative_audio_ms = 0
+                    all_word_timings = []
                     for chunk_index, text_chunk in enumerate(text_chunks, start=1):
-                        status.info(f"Audiobook synthesis: chunk {chunk_index}/{total}. Retrying automatically if needed...")
+                        chunk_word_timings = []
                         chunk_bytes = await synthesize_with_retry(
                             text_chunk,
                             audiobook_voice,
-                            chunk_label=f"Audiobook chunk {chunk_index}/{total}"
+                            chunk_label=f"Audiobook chunk {chunk_index}/{total}",
+                            word_timings=chunk_word_timings
                         )
                         segment = AudioSegment.from_file(io.BytesIO(chunk_bytes), format="mp3")
+
+                        # Edge TTS timestamps are relative to each request; shift them
+                        # onto the continuous audiobook timeline before storing.
+                        for timing in chunk_word_timings:
+                            all_word_timings.append({
+                                "text": timing["text"],
+                                "start_ms": cumulative_audio_ms + timing["offset_ms"],
+                                "end_ms": cumulative_audio_ms + timing["offset_ms"] + max(1, timing["duration_ms"]),
+                            })
+
                         combined += segment
-                        progress.progress(int(chunk_index / total * 90))
+                        cumulative_audio_ms += len(segment)
+                        percent = max(1, min(99, int(chunk_index / total * 99)))
+                        progress.progress(percent, text=f"{percent}%")
                         if chunk_index < total:
                             await asyncio.sleep(REQUEST_PAUSE_SECONDS)
 
@@ -619,7 +603,6 @@ with tab3:
                         raise RuntimeError("Audiobook synthesis returned an empty audio track.")
 
                     if music_file is not None:
-                        status.info("Mixing background music...")
                         music_file.seek(0)
                         music = AudioSegment.from_file(music_file, format="mp3")
                         if len(music) == 0:
@@ -633,11 +616,11 @@ with tab3:
 
                     output = io.BytesIO()
                     combined.export(output, format="mp3", bitrate="192k")
-                    return output.getvalue(), total, len(combined)
+                    return output.getvalue(), total, len(combined), all_word_timings
 
-                final_bytes, total_chunks, duration_ms = asyncio.run(build_audiobook())
-                progress.progress(100)
-                status.success(f"Audiobook created. {total_chunks} chunks merged into one MP3.")
+                final_bytes, total_chunks, duration_ms, word_timings_for_session = asyncio.run(build_audiobook())
+                progress.progress(100, text="100%")
+                status.success("Audiobook created successfully.")
                 st.caption(
                     f"⏱️ Generated in {time.time() - start_time:.1f} seconds | "
                     f"Audio duration: {duration_ms / 60000:.1f} minutes"
@@ -648,54 +631,64 @@ with tab3:
                     "WordWave_Audiobook.mp3", "audio/mpeg", use_container_width=True
                 )
 
-                if generate_srt:
-                    # These are chunk-level captions with estimated timing, not word-level timings.
-                    total_chars = sum(len(chunk) for chunk in text_chunks)
-                    elapsed_ms = 0
-                    srt_entries = []
-                    for number, chunk in enumerate(text_chunks, start=1):
-                        estimated_ms = max(1000, int(duration_ms * len(chunk) / max(total_chars, 1)))
-                        start_ms = elapsed_ms
-                        end_ms = min(duration_ms, elapsed_ms + estimated_ms)
-                        def stamp(ms):
-                            hours = ms // 3600000
-                            minutes = (ms % 3600000) // 60000
-                            seconds = (ms % 60000) // 1000
-                            millis = ms % 1000
-                            return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
-                        srt_entries.append(
-                            f"{number}\n{stamp(start_ms)} --> {stamp(end_ms)}\n{chunk}\n"
-                        )
-                        elapsed_ms = end_ms
-                    srt_data = "\n".join(srt_entries)
-                    st.download_button(
-                        "⬇️ Download Approximate SRT Subtitles",
-                        srt_data.encode("utf-8"),
-                        "WordWave_Subtitles.srt",
-                        "text/plain",
-                        use_container_width=True
-                    )
-                    st.caption("SRT timestamps are estimated per text chunk; they are not word-level synchronized captions.")
+                # Temporary session-memory cache only. No SRT formatting/file work
+                # is performed during audio synthesis.
+                st.session_state["ab_word_timings"] = word_timings_for_session
+                st.session_state["ab_audio_duration_ms"] = duration_ms
+                st.session_state["ab_audio_ready"] = True
+
 
             except Exception as error:
                 progress.empty()
                 status.empty()
                 show_generation_error("Audiobook production failed.", error)
 
-# ===========================================================
-# FOOTER / TROUBLESHOOTING
-# ===========================================================
-with st.expander("🧰 Troubleshooting: Edge TTS"):
-    st.markdown(
-        """
-        - **403 / WebSocket handshake:** Microsoft may be rejecting the connection, or a network/proxy is blocking it. Retry later and update `edge-tts`.
-        - **429 / rate limit:** Wait before retrying. Avoid running several large jobs at once.
-        - **Timeout / connection reset:** Check internet stability. The app retries each chunk automatically.
-        - **No audio received:** The service returned no audio for a chunk. The error panel identifies the failed chunk and shows a text preview.
-        - **Invalid MP3 / decode error:** The returned bytes could not be decoded. Check the installed FFmpeg and pydub environment.
 
-        Update packages with: `pip install --upgrade edge-tts streamlit pydub`
 
-        `pydub` requires FFmpeg to be installed and available on PATH for MP3 decoding/encoding.
-        """
-    )
+    # Create exact word-by-word SRT only after the user explicitly requests it.
+    # Timing data is held in Streamlit session memory and is not written to disk.
+    if st.session_state.get("ab_audio_ready"):
+        st.divider()
+        st.markdown("#### Optional word-by-word subtitles")
+        st.caption("Uses Edge TTS word-boundary timestamps retained temporarily during synthesis. No SRT is created during audio generation.")
+        if st.button("📝 Create word-by-word SRT", key="create_word_srt"):
+            saved_timings = st.session_state.get("ab_word_timings", [])
+            if not saved_timings:
+                st.error(
+                    "Edge TTS did not return word-boundary timing metadata for this audio. "
+                    "A word-by-word SRT cannot be created accurately."
+                )
+            else:
+                def srt_stamp(milliseconds):
+                    milliseconds = max(0, int(milliseconds))
+                    hours = milliseconds // 3600000
+                    minutes = (milliseconds % 3600000) // 60000
+                    seconds = (milliseconds % 60000) // 1000
+                    millis = milliseconds % 1000
+                    return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
+
+                srt_entries = []
+                for item in saved_timings:
+                    word = item.get("text", "").strip()
+                    if not word:
+                        continue
+                    begin = item["start_ms"]
+                    finish = max(begin + 1, item["end_ms"])
+                    srt_entries.append(
+                        f"{len(srt_entries) + 1}\n"
+                        f"{srt_stamp(begin)} --> {srt_stamp(finish)}\n"
+                        f"{word}\n"
+                    )
+
+                if srt_entries:
+                    st.download_button(
+                        "⬇️ Download Word-by-Word SRT",
+                        "\n".join(srt_entries).encode("utf-8"),
+                        "WordWave_Word_Timing.srt",
+                        "application/x-subrip",
+                        use_container_width=True,
+                        key="download_word_srt"
+                    )
+                else:
+                    st.error("No usable word-boundary timing entries were returned by Edge TTS.")
+
